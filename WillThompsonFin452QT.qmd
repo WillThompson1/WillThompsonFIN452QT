@@ -27,7 +27,7 @@ execute:
 
 This project implements a **cluster-relative mean reversion** strategy on the S&P 500 Select Sector SPDR ETFs. The core hypothesis is that sector ETFs form behavioral clusters, and temporary deviations of an ETF from its cluster-relative fair value contain a tradable mean-reversion signal.
 
-**Clustering is the primary signal engine.** It determines which ETFs are comparable at each rebalance date and defines what "fair value" means for each ETF. The **Kalman filter refines** — not replaces — the cluster-relative signal by smoothing the residual series and providing a statistically interpretable z-score threshold for trade entry.
+**Clustering is the primary signal engine.** It determines which ETFs are comparable at each rebalance date and defines what "fair value" means for each ETF. The **Kalman filter refines** — not replaces — the cluster-relative signal by smoothing the residual series and providing a statistically interpretable z-score for trade entry.
 
 ## Mental Model Diagram
 
@@ -64,10 +64,10 @@ flowchart TD
     end
 
     subgraph CL["⑤ PRIMARY SIGNAL ENGINE: Clustering"]
-        C1["Standardize features at each month-end\n(recipes::recipe — tidymodels preprocessing)"]
-        C2["Hierarchical clustering with Ward.D2 linkage"]
-        C3["Assign ETFs to behavioral clusters"]
-        C4["'Fair value is cluster-relative, not global'"]
+        C1["Elbow method → choose k clusters"]
+        C2["K-Means + Hierarchical (Ward.D2)\nAgreement = robust structure"]
+        C3["Silhouette validation\nSilhouette > 0.5 = well-clustered"]
+        C4["Fair value is cluster-relative, not global"]
     end
 
     subgraph RE["⑥ Residual Construction"]
@@ -99,7 +99,7 @@ flowchart TD
     subgraph VA["⑩ Validation & Iteration"]
         V1["Training 2000–2024: parameter selection"]
         V2["Testing 2025–2026: out-of-sample evaluation"]
-        V3["Metrics: Sharpe, Omega, max drawdown,\nhit rate, turnover, stability"]
+        V3["tradeStats: Sharpe, Omega, %.Win,\n%.InMrkt, DD.Max, DD.Length"]
         V4["Bias checks: look-ahead, overfitting,\nstorytelling, structural breaks"]
     end
 
@@ -128,42 +128,47 @@ library(lubridate)
 # ── Market data ────────────────────────────────────────────────────────────────
 library(tidyquant)
 library(timetk)
+library(quantmod)
 
 # ── Rolling statistics ─────────────────────────────────────────────────────────
 library(slider)
 library(TTR)
 
-# ── Tidymodels (preprocessing workflow and data splitting) ─────────────────────
+# ── Tidymodels (preprocessing + data splitting) ────────────────────────────────
 library(tidymodels)
 library(rsample)
 library(recipes)
 
 # ── Clustering ─────────────────────────────────────────────────────────────────
-library(cluster)
-library(factoextra)
+library(cluster)      # silhouette()
+library(factoextra)   # fviz_dend(), fviz_silhouette()
+
+# ── Performance analytics ──────────────────────────────────────────────────────
+library(PerformanceAnalytics)   # SharpeRatio, Omega, chart.Drawdown, table.Drawdowns
 
 # ── Visualization ──────────────────────────────────────────────────────────────
 library(patchwork)
 library(scales)
 library(viridis)
+library(plotly)
 
 # ── Tables ─────────────────────────────────────────────────────────────────────
 library(gt)
 library(knitr)
 
-# Resolve any tidymodels / other namespace conflicts
+# Resolve namespace conflicts
 tidymodels_prefer()
 ```
 
 ## 1.2 Strategy Parameters
 
-All unresolved design decisions are centralized here with their rationale. Changing any value here propagates through the entire document.
+All unresolved design decisions are centralized here with rationale. Changing any value propagates through the entire document.
 
 ```{r parameters}
 #| cache: false
 
 # ── Date ranges ────────────────────────────────────────────────────────────────
-DATA_START  <- as.Date("2000-01-01")   # Pull extra history for rolling-feature warmup
+DATA_START  <- as.Date("2000-01-01")   # Extra history for rolling-feature warmup
 TRAIN_START <- as.Date("2000-06-01")   # First full month of training period
 TRAIN_END   <- as.Date("2024-12-31")   # End of training period
 TEST_START  <- as.Date("2025-01-01")   # Out-of-sample begins
@@ -172,41 +177,37 @@ TEST_END    <- as.Date("2026-03-31")   # Inclusive through March 2026
 # ── Feature engineering windows (trading days) ─────────────────────────────────
 VOL_SHORT   <- 20L   # ~1-month rolling volatility            [DEFAULT: 20]
 VOL_LONG    <- 60L   # ~3-month rolling volatility            [DEFAULT: 60]
-CORR_WINDOW <- 60L   # Rolling correlation/beta vs SPY        [DEFAULT: 60]
+CORR_WINDOW <- 60L   # Rolling correlation / beta vs SPY      [DEFAULT: 60]
 RET_WINDOW  <- 60L   # Rolling cumulative return for residual [DEFAULT: 60]
 
 # ── Clustering ─────────────────────────────────────────────────────────────────
-# [UNRESOLVED] N_CLUSTERS: balances interpretability vs granularity.
+# N_CLUSTERS: Chosen using elbow method (WSS) in section 6.
 # With 10-11 ETFs, k=3 gives ~3-4 members per cluster on average.
-# Validate: run sensitivity across k = 2, 3, 4.
+# [UNRESOLVED] Validate: run elbow method and silhouette across k = 2..5.
 N_CLUSTERS  <- 3L
-LINK_METHOD <- "ward.D2"   # Ward linkage: minimises within-cluster variance
+LINK_METHOD <- "ward.D2"   # Ward linkage: minimises within-cluster variance (preferred for finance)
 
-# Features used for clustering — compact, interpretable, economically motivated
+# Features used for clustering
 CLUSTER_FEATURES <- c("vol_20", "vol_60", "corr_spy_60", "beta_spy_60", "rel_ret_60")
 
 # ── Kalman filter ──────────────────────────────────────────────────────────────
-# [UNRESOLVED] Q and R: ratio Q/R controls smoothing speed.
-# Low Q/R → state adapts slowly → smoother signal, less responsive.
-# High Q/R → state tracks observations closely → noisier signal.
-# Default: Q/R = 0.1 (moderately smooth). Validate in sensitivity section.
+# [UNRESOLVED] Q/R ratio controls smoothing: low Q/R = slow adaptation (smoother).
+# Default Q/R = 0.1 (moderately smooth). Sensitivity tested in section 13.
 KF_Q <- 0.001   # Process noise variance  [DEFAULT: 0.001]
 KF_R <- 0.01    # Observation noise variance [DEFAULT: 0.01]
 
 # ── Signal thresholds ──────────────────────────────────────────────────────────
-# [UNRESOLVED] SIGNAL_THRESHOLD: margin of safety. Only trade z-scores >= this.
-# Default of 1.0 ≈ 1 standard deviation above/below predicted fair value.
-SIGNAL_THRESHOLD <- 1.0   # [DEFAULT: 1.0]
+# [UNRESOLVED] Margin of safety: only trade |z| >= this value.
+SIGNAL_THRESHOLD <- 1.0   # [DEFAULT: 1.0 ~ 1 standard deviation]
 
 # ── Portfolio construction ─────────────────────────────────────────────────────
-# [UNRESOLVED] Max positions: balances diversification vs signal dilution.
+# [UNRESOLVED] Balances diversification vs signal dilution.
 MAX_LONGS  <- 3L   # Maximum long positions per rebalance  [DEFAULT: 3]
 MAX_SHORTS <- 3L   # Maximum short positions per rebalance [DEFAULT: 3]
 
 # ── Execution assumption (fixed) ───────────────────────────────────────────────
-# Signal generated at month-end close.
-# Position return = next calendar month close-to-close return.
-# This is strictly causal: no future information used at signal date.
+# Signal at month-end close → position return = next month close-to-close.
+# Strictly causal: no future information used at signal generation time.
 ```
 
 ## 1.3 Universe Definition
@@ -217,26 +218,19 @@ MAX_SHORTS <- 3L   # Maximum short positions per rebalance [DEFAULT: 3]
 TICKERS <- c(
   "SPY",   # Benchmark — S&P 500
   "XLB",   # Materials
-  "XLC",   # Communication Services (data from June 2018)
+  "XLC",   # Communication Services (from June 2018)
   "XLE",   # Energy
   "XLF",   # Financials
   "XLI",   # Industrials
   "XLK",   # Technology
   "XLP",   # Consumer Staples
-  "XLRE",  # Real Estate (data from October 2015)
+  "XLRE",  # Real Estate (from October 2015)
   "XLV",   # Health Care
   "XLU",   # Utilities
   "XLY"    # Consumer Discretionary
 )
 
 SECTOR_TICKERS <- setdiff(TICKERS, "SPY")
-
-# ETFs with restricted history — excluded from clustering before their start dates
-SHORT_HISTORY <- list(
-  XLC  = as.Date("2018-06-19"),
-  XLRE = as.Date("2015-10-07")
-)
-
 cat("Universe: SPY (benchmark) +", length(SECTOR_TICKERS), "sector ETFs\n")
 ```
 
@@ -246,12 +240,11 @@ cat("Universe: SPY (benchmark) +", length(SECTOR_TICKERS), "sector ETFs\n")
 
 ## 2.1 Download Price Data
 
-All data is pulled via the `tidyquant::tq_get()` API. No local files are used.
+All data pulled via `tidyquant::tq_get()` (Yahoo Finance API). No local files used.
 
 ```{r data-download}
-# Pull daily OHLCV data for the full universe via Yahoo Finance API.
 # tq_get() returns: symbol, date, open, high, low, close, volume, adjusted
-# The 'adjusted' column is split and dividend adjusted — used for all returns.
+# 'adjusted' = split and dividend adjusted close — used for all return calculations
 
 raw_prices <- tq_get(
   TICKERS,
@@ -261,8 +254,7 @@ raw_prices <- tq_get(
 
 cat("Download complete.\n")
 cat("Date range  :", format(min(raw_prices$date)), "to", format(max(raw_prices$date)), "\n")
-cat("Rows        :", nrow(raw_prices), "\n")
-cat("Symbols     :", n_distinct(raw_prices$symbol), "\n")
+cat("Rows        :", nrow(raw_prices), "| Symbols:", n_distinct(raw_prices$symbol), "\n")
 ```
 
 ## 2.2 Data Integrity Checks
@@ -280,11 +272,11 @@ if (length(missing_tickers) > 0) {
 coverage_tbl <- raw_prices |>
   group_by(symbol) |>
   summarise(
-    first_date  = min(date),
-    last_date   = max(date),
-    n_obs       = n(),
-    pct_na_adj  = round(mean(is.na(adjusted)) * 100, 2),
-    .groups     = "drop"
+    first_date = min(date),
+    last_date  = max(date),
+    n_obs      = n(),
+    pct_na_adj = round(mean(is.na(adjusted)) * 100, 2),
+    .groups    = "drop"
   ) |>
   arrange(first_date)
 
@@ -301,8 +293,8 @@ coverage_tbl |>
     pct_na_adj = "% Missing (Adj)"
   )
 
-# ── Check 3: No unexpected NA in adjusted for standard tickers ────────────────
-standard_tickers <- setdiff(TICKERS, names(SHORT_HISTORY))
+# ── Check 3: No NA in adjusted for standard tickers in training period ─────────
+standard_tickers <- setdiff(TICKERS, c("XLC", "XLRE"))
 na_standard <- raw_prices |>
   filter(symbol %in% standard_tickers, date >= TRAIN_START, is.na(adjusted)) |>
   nrow()
@@ -320,24 +312,27 @@ if (na_standard > 0) {
 
 ## 3.1 Adjusted Prices and Daily Returns
 
+Following the course notes pattern — three return types for precise P&L accounting:
+
 ```{r preprocessing}
-# Keep adjusted close only — this is the correct price for return calculations.
-# Both log returns (for compounding math) and simple returns (for portfolio arithmetic)
-# are computed. Simple returns are used in portfolio construction.
+# Keep adjusted close for return calculations.
+# Mirror course notes: retClCl (close-to-close), retOpCl (open-to-close same day),
+# retClOp (open vs prior close). Used for precise execution assumptions.
 
 prices <- raw_prices |>
-  select(symbol, date, adjusted) |>
+  select(symbol, date, open, close, adjusted) |>
   arrange(symbol, date)
 
 returns_daily <- prices |>
   group_by(symbol) |>
   arrange(date) |>
   mutate(
-    log_ret    = log(adjusted / lag(adjusted)),
-    simple_ret = adjusted / lag(adjusted) - 1
+    retClCl = adjusted / lag(adjusted) - 1,           # Close-to-close (hold overnight)
+    retOpCl = (close - open) / close,                 # Open-to-close same day (intraday)
+    retClOp = open / lag(adjusted) - 1                # Prior close to open (gap return)
   ) |>
   ungroup() |>
-  filter(!is.na(log_ret))
+  filter(!is.na(retClCl))
 
 cat("Daily returns computed.\n")
 cat("Total rows:", nrow(returns_daily), "\n")
@@ -346,9 +341,7 @@ cat("Total rows:", nrow(returns_daily), "\n")
 ## 3.2 Calendar Alignment
 
 ```{r alignment}
-# Align all series to the SPY trading calendar.
-# This removes non-trading days and ensures a consistent daily panel.
-
+# Align all series to the SPY trading calendar (removes non-trading days).
 spy_calendar <- returns_daily |>
   filter(symbol == "SPY") |>
   pull(date)
@@ -356,89 +349,61 @@ spy_calendar <- returns_daily |>
 returns_daily <- returns_daily |>
   filter(date %in% spy_calendar)
 
-# Wide format for bivariate rolling calculations (correlation, beta with SPY)
 spy_rets_wide <- returns_daily |>
   filter(symbol == "SPY") |>
-  select(date, SPY = simple_ret)
+  select(date, SPY = retClCl)
 
-cat("Calendar aligned to SPY.\n")
-cat("Date range:", format(min(returns_daily$date)), "to", format(max(returns_daily$date)), "\n")
-cat("Total trading days:", n_distinct(returns_daily$date), "\n")
+cat("Calendar aligned to SPY. Trading days:", n_distinct(returns_daily$date), "\n")
 ```
 
 ## 3.3 Train / Test Split
 
 ```{r train-test-split}
-# Strict temporal split following tidymodels philosophy.
-# No testing period data is used during parameter design or model building.
-
-# Define the split boundary
-split_boundary <- TRAIN_END
-
+# Strict temporal split — no testing period data used during model design.
 returns_train <- returns_daily |> filter(date >= TRAIN_START, date <= TRAIN_END)
 returns_test  <- returns_daily |> filter(date >= TEST_START,  date <= TEST_END)
 
-# Leakage guard — must have zero overlap
+# Leakage guard
 overlap <- intersect(returns_train$date, returns_test$date)
 stopifnot("LEAKAGE DETECTED: train and test dates overlap!" = length(overlap) == 0)
 
-cat("Training period :", format(TRAIN_START), "to", format(TRAIN_END),
+cat("Training:", format(TRAIN_START), "to", format(TRAIN_END),
     "—", n_distinct(returns_train$date), "trading days\n")
-cat("Testing period  :", format(TEST_START),  "to", format(TEST_END),
+cat("Testing :", format(TEST_START),  "to", format(TEST_END),
     "—", n_distinct(returns_test$date), "trading days\n")
-cat("LEAKAGE CHECK PASS: No date overlap between periods.\n")
+cat("LEAKAGE CHECK PASS: No date overlap.\n")
 ```
 
 ---
 
 # 4. Feature Engineering
 
-Rolling features capture the behavioral fingerprint of each ETF over a 60-day lookback. All features are computed in a **strictly causal** manner — only data up to and including each date is used.
-
-| Feature | Window | Purpose |
-|---|---|---|
-| `vol_20` | 20 days | Short-term return volatility |
-| `vol_60` | 60 days | Medium-term volatility regime |
-| `corr_spy_60` | 60 days | Sensitivity direction vs market |
-| `beta_spy_60` | 60 days | Market-loading magnitude |
-| `rel_ret_60` | 60 days | Performance gap vs benchmark |
+Rolling features capture each ETF's behavioral fingerprint over a 60-day lookback. All features are computed **strictly causally** — only data up to and including each date is used.
 
 ```{r feature-engineering}
 # ── Rolling helper functions ───────────────────────────────────────────────────
 
-# Pearson correlation between two vectors over a rolling window
 roll_cor <- function(x, y, n) {
-  slider::slide2_dbl(
-    x, y,
-    .f        = ~ cor(.x, .y, use = "complete.obs"),
-    .before   = n - 1L,
-    .complete = TRUE
-  )
+  slider::slide2_dbl(x, y,
+    .f = ~ cor(.x, .y, use = "complete.obs"),
+    .before = n - 1L, .complete = TRUE)
 }
 
-# OLS beta (slope: x regressed on y) over a rolling window
 roll_beta <- function(x, y, n) {
-  slider::slide2_dbl(
-    x, y,
+  slider::slide2_dbl(x, y,
     .f = ~ {
       df <- data.frame(x = .x, y = .y)
       df <- df[complete.cases(df), ]
       if (nrow(df) < 10L) return(NA_real_)
       coef(lm(x ~ y, data = df))[2L]
     },
-    .before   = n - 1L,
-    .complete = TRUE
-  )
+    .before = n - 1L, .complete = TRUE)
 }
 
-# Compounded (geometric) return over a rolling window
 roll_cum_ret <- function(x, n) {
-  slider::slide_dbl(
-    x,
-    .f        = ~ prod(1 + .x, na.rm = FALSE) - 1,
-    .before   = n - 1L,
-    .complete = TRUE
-  )
+  slider::slide_dbl(x,
+    .f = ~ prod(1 + .x, na.rm = FALSE) - 1,
+    .before = n - 1L, .complete = TRUE)
 }
 
 # ── Compute features for all sector ETFs ──────────────────────────────────────
@@ -448,20 +413,17 @@ features_daily <- returns_daily |>
   group_by(symbol) |>
   arrange(date) |>
   mutate(
-    # Annualised rolling volatility (sd * sqrt(252))
-    vol_20      = slider::slide_dbl(simple_ret, sd, .before = VOL_SHORT - 1L, .complete = TRUE) * sqrt(252),
-    vol_60      = slider::slide_dbl(simple_ret, sd, .before = VOL_LONG  - 1L, .complete = TRUE) * sqrt(252),
-
-    # Rolling bivariate vs SPY
-    corr_spy_60 = roll_cor(simple_ret, SPY, CORR_WINDOW),
-    beta_spy_60 = roll_beta(simple_ret, SPY, CORR_WINDOW),
-
-    # Rolling 60-day compounded returns
-    cum_ret_60  = roll_cum_ret(simple_ret, RET_WINDOW),
+    vol_20      = slider::slide_dbl(retClCl, sd, .before = VOL_SHORT - 1L, .complete = TRUE) * sqrt(252),
+    vol_60      = slider::slide_dbl(retClCl, sd, .before = VOL_LONG  - 1L, .complete = TRUE) * sqrt(252),
+    corr_spy_60 = roll_cor(retClCl, SPY, CORR_WINDOW),
+    beta_spy_60 = roll_beta(retClCl, SPY, CORR_WINDOW),
+    cum_ret_60  = roll_cum_ret(retClCl, RET_WINDOW),
     spy_cum_60  = roll_cum_ret(SPY, RET_WINDOW),
-
-    # Relative return vs SPY (excess cumulative return)
-    rel_ret_60  = cum_ret_60 - spy_cum_60
+    rel_ret_60  = cum_ret_60 - spy_cum_60,
+    # Also compute Sharpe (for clustering summary, matching class notes style)
+    sharpe_60   = slider::slide_dbl(retClCl,
+                    ~ if (sd(.x) == 0) NA_real_ else mean(.x) / sd(.x) * sqrt(252),
+                    .before = VOL_LONG - 1L, .complete = TRUE)
   ) |>
   ungroup() |>
   select(-SPY, -spy_cum_60)
@@ -469,11 +431,10 @@ features_daily <- returns_daily |>
 cat("Feature engineering complete.\n")
 ```
 
-## 4.1 Feature Completeness Check
+## 4.1 Feature Completeness
 
 ```{r feature-check}
-# Verify completeness — early observations will be NA due to rolling windows
-feature_check <- features_daily |>
+features_daily |>
   filter(date >= TRAIN_START) |>
   group_by(symbol) |>
   summarise(
@@ -481,21 +442,14 @@ feature_check <- features_daily |>
     pct_corr60   = round(mean(!is.na(corr_spy_60)) * 100, 1),
     pct_cumret60 = round(mean(!is.na(cum_ret_60)) * 100, 1),
     .groups = "drop"
-  )
-
-feature_check |>
+  ) |>
   gt() |>
   tab_header(title = "Feature Completeness in Training Period (%)") |>
-  fmt_number(columns = where(is.numeric), decimals = 1) |>
-  cols_label(
-    symbol     = "Ticker",
-    pct_vol20  = "vol_20 %",
-    pct_corr60 = "corr_spy_60 %",
-    pct_cumret60 = "cum_ret_60 %"
-  )
+  cols_label(symbol = "Ticker", pct_vol20 = "vol_20 %",
+             pct_corr60 = "corr_spy_60 %", pct_cumret60 = "cum_ret_60 %")
 ```
 
-## 4.2 Feature Distribution
+## 4.2 Feature Distributions
 
 ```{r feature-dist}
 features_daily |>
@@ -507,10 +461,8 @@ features_daily |>
   geom_histogram(bins = 60, show.legend = FALSE, color = "white", linewidth = 0.1) +
   facet_wrap(~ feature, scales = "free", ncol = 3) +
   scale_fill_viridis_d() +
-  labs(
-    title = "Feature Distributions — Training Period (2000–2024)",
-    x = "Value", y = "Count"
-  ) +
+  labs(title = "Feature Distributions — Training Period (2000–2024)",
+       x = "Value", y = "Count") +
   theme_minimal(base_size = 11)
 ```
 
@@ -520,8 +472,6 @@ features_daily |>
 
 ```{r month-ends}
 # Identify the last SPY trading day in each calendar month.
-# These are the rebalance trigger dates — the only moments portfolio positions change.
-
 all_trading_days <- sort(unique(returns_daily$date))
 
 month_ends_all <- tibble(date = all_trading_days) |>
@@ -535,43 +485,84 @@ train_month_ends <- month_ends_all[month_ends_all >= TRAIN_START & month_ends_al
 test_month_ends  <- month_ends_all[month_ends_all >= TEST_START  & month_ends_all <= TEST_END]
 all_month_ends   <- c(train_month_ends, test_month_ends)
 
-cat("Rebalance dates — Training:", length(train_month_ends), "\n")
-cat("Rebalance dates — Testing :", length(test_month_ends), "\n")
-cat("Total rebalance dates      :", length(all_month_ends), "\n")
+cat("Training rebalance dates:", length(train_month_ends), "\n")
+cat("Testing  rebalance dates:", length(test_month_ends), "\n")
 ```
 
 ---
 
 # 6. Clustering
 
-Clustering is the **primary signal engine**. At each month-end rebalance date, sector ETFs are grouped into behaviorally similar clusters using the rolling feature snapshot. Cluster membership defines each ETF's comparison set — fair value is cluster-relative, not global.
+Clustering is the **primary signal engine**. At each month-end, sector ETFs are grouped into behaviorally similar clusters using rolling feature snapshots. Cluster membership defines each ETF's comparison set — fair value is cluster-relative, not global.
 
-**Tidymodels role**: `recipes::recipe()` handles feature standardization within each clustering call. This ensures consistent preprocessing at every rebalance date.
+Following the class notes: we run **both K-Means and Hierarchical** clustering and check for agreement. Agreement = robust structure. Disagreement = investigate further.
 
-**Look-ahead protection**: Clusters are formed using only data available up to each rebalance date. The Kalman filter is then applied sequentially, so no future information contaminates any signal.
+## 6.1 Elbow Method: Optimal Number of Clusters
 
-## 6.1 Clustering Functions
+Following the class notes — don't guess k, use the WSS elbow method:
+
+```{r elbow-method}
+# Compute within-cluster sum of squares for k = 1 to 6 on a representative snapshot
+# Use the most recent training month-end for illustration
+last_train_date <- max(train_month_ends)
+
+snap_elbow <- features_daily |>
+  filter(date == last_train_date) |>
+  select(symbol, all_of(CLUSTER_FEATURES)) |>
+  drop_na()
+
+feat_elbow <- as.data.frame(select(snap_elbow, -symbol))
+rownames(feat_elbow) <- snap_elbow$symbol
+
+# Standardize (matching recipes::recipe() approach)
+scaled_elbow <- scale(feat_elbow)
+
+max_k <- min(6L, nrow(scaled_elbow) - 1L)
+
+wss <- purrr::map_dbl(1:max_k, function(k) {
+  stats::kmeans(scaled_elbow, centers = k, nstart = 25L)$tot.withinss
+})
+
+tibble(k = 1:max_k, wss = wss) |>
+  ggplot(aes(x = k, y = wss)) +
+  geom_line(color = "#1565C0", linewidth = 1) +
+  geom_point(size = 3, color = "#1565C0") +
+  geom_vline(xintercept = N_CLUSTERS, linetype = "dashed", color = "#E53935") +
+  scale_x_continuous(breaks = 1:max_k) +
+  labs(
+    title    = "Elbow Method — Optimal Number of Clusters",
+    subtitle = paste0("Red dashed line = chosen k = ", N_CLUSTERS,
+                      " | Look for the elbow where improvement slows"),
+    x = "Number of Clusters (k)", y = "Within-Cluster Sum of Squares (WSS)"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+## 6.2 Clustering Functions
 
 ```{r clustering-functions}
-# ── Standardize features using a recipes pipeline (tidymodels preprocessing) ──
+# ── Standardize features using recipes pipeline (tidymodels preprocessing) ────
 standardize_features <- function(df) {
-  # df: data frame where rows = ETFs, cols = numeric features
   rec <- recipe(~ ., data = df) |>
     step_normalize(all_numeric_predictors()) |>
     prep(training = df, verbose = FALSE)
   bake(rec, new_data = df)
 }
 
-# ── Hierarchical clustering on standardized features ──────────────────────────
-cluster_etfs <- function(feature_mat, k = N_CLUSTERS, method = LINK_METHOD) {
-  # feature_mat: data frame, row names = ticker symbols
+# ── Hierarchical clustering (Ward.D2) ─────────────────────────────────────────
+cluster_hierarchical <- function(feature_mat, k = N_CLUSTERS, method = LINK_METHOD) {
   scaled   <- standardize_features(feature_mat)
   dist_mat <- dist(scaled, method = "euclidean")
   hc       <- hclust(dist_mat, method = method)
-  list(
-    assignments = cutree(hc, k = k),   # named integer vector (names = tickers)
-    hclust_obj  = hc
-  )
+  list(assignments = cutree(hc, k = k), hclust_obj = hc, dist_mat = dist_mat)
+}
+
+# ── K-Means clustering ────────────────────────────────────────────────────────
+cluster_kmeans <- function(feature_mat, k = N_CLUSTERS, seed = 42L) {
+  scaled <- standardize_features(feature_mat)
+  set.seed(seed)
+  km <- stats::kmeans(scaled, centers = k, nstart = 25L)
+  list(assignments = km$cluster, kmeans_obj = km, scaled = scaled)
 }
 
 # ── Apply clustering at a single rebalance date ────────────────────────────────
@@ -582,30 +573,28 @@ cluster_at_date <- function(d, features_df, k = N_CLUSTERS) {
     drop_na()
 
   if (nrow(snap) < k) {
-    message("Date ", d, ": only ", nrow(snap), " ETFs available — skipping.")
+    message("Date ", d, ": only ", nrow(snap), " ETFs — skipping.")
     return(NULL)
   }
 
   feat_mat <- as.data.frame(select(snap, -symbol))
   rownames(feat_mat) <- snap$symbol
 
-  result <- cluster_etfs(feat_mat, k = k)
+  hc_res <- cluster_hierarchical(feat_mat, k = k)
+  km_res <- cluster_kmeans(feat_mat, k = k)
 
   tibble(
-    date    = d,
-    symbol  = names(result$assignments),
-    cluster = as.integer(result$assignments)
+    date           = d,
+    symbol         = names(hc_res$assignments),
+    cluster        = as.integer(hc_res$assignments),
+    cluster_kmeans = as.integer(km_res$assignments[names(hc_res$assignments)])
   )
 }
 ```
 
-## 6.2 Apply Clustering at Every Rebalance Date
+## 6.3 Apply Clustering at Every Rebalance Date
 
 ```{r run-clustering}
-# Cluster assignments are computed for both train and test periods.
-# At test dates, the clustering uses only data available up to that date
-# (feature_daily is itself built causally, so no leakage).
-
 cat("Running monthly clustering across", length(all_month_ends), "rebalance dates...\n")
 
 cluster_history <- purrr::map_dfr(
@@ -613,24 +602,93 @@ cluster_history <- purrr::map_dfr(
   ~ cluster_at_date(.x, features_daily, k = N_CLUSTERS)
 )
 
-cat("Clustering complete.\n")
-cat("Total assignment rows:", nrow(cluster_history), "\n")
-
 # Coverage check
 cluster_coverage <- cluster_history |>
   group_by(date) |>
   summarise(n_etfs = n(), n_clusters = n_distinct(cluster), .groups = "drop")
 
-cat("Avg ETFs per rebalance date:", round(mean(cluster_coverage$n_etfs), 1), "\n")
-cat("Avg clusters per date      :", round(mean(cluster_coverage$n_clusters), 1), "\n")
+cat("Clustering complete.\n")
+cat("Total assignment rows       :", nrow(cluster_history), "\n")
+cat("Avg ETFs per rebalance date :", round(mean(cluster_coverage$n_etfs), 1), "\n")
 ```
 
-## 6.3 Cluster Stability Heatmap
+## 6.4 Silhouette Analysis: Cluster Quality Validation
+
+Following the class notes — silhouette width > 0.5 suggests reasonable clustering; negative values indicate potential misclassification.
+
+```{r silhouette-analysis}
+# Compute silhouette for K-Means and Hierarchical on the most recent training snapshot
+snap_sil <- features_daily |>
+  filter(date == last_train_date) |>
+  select(symbol, all_of(CLUSTER_FEATURES)) |>
+  drop_na()
+
+feat_sil <- as.data.frame(select(snap_sil, -symbol))
+rownames(feat_sil) <- snap_sil$symbol
+scaled_sil  <- as.matrix(standardize_features(feat_sil))
+dist_sil    <- dist(scaled_sil)
+
+# Hierarchical silhouette
+hc_sil  <- hclust(dist_sil, method = LINK_METHOD)
+cuts_hc <- cutree(hc_sil, k = N_CLUSTERS)
+sil_hc  <- cluster::silhouette(cuts_hc, dist_sil)
+
+# K-Means silhouette
+set.seed(42L)
+km_sil  <- stats::kmeans(scaled_sil, centers = N_CLUSTERS, nstart = 25L)
+sil_km  <- cluster::silhouette(km_sil$cluster, dist_sil)
+
+p_sil_hc <- factoextra::fviz_silhouette(sil_hc) +
+  labs(title = paste("Silhouette — Hierarchical (k =", N_CLUSTERS, ")"),
+       subtitle = paste("Avg width:", round(mean(sil_hc[, "sil_width"]), 3),
+                        "| >0.5 = well-clustered | <0.3 = weak")) +
+  theme_minimal(base_size = 10)
+
+p_sil_km <- factoextra::fviz_silhouette(sil_km) +
+  labs(title = paste("Silhouette — K-Means (k =", N_CLUSTERS, ")"),
+       subtitle = paste("Avg width:", round(mean(sil_km[, "sil_width"]), 3))) +
+  theme_minimal(base_size = 10)
+
+p_sil_hc / p_sil_km
+
+# Agreement check — do both methods agree?
+agreement_pct <- mean(cuts_hc == km_sil$cluster) * 100
+cat("\nCluster method agreement:", round(agreement_pct, 1), "%\n")
+cat("Interpretation: Agreement >= 70% suggests robust structure.\n")
+```
+
+## 6.5 K-Means vs Hierarchical Comparison
+
+```{r method-comparison}
+# Compare cluster assignments at the last training date
+cluster_history |>
+  filter(date == last_train_date) |>
+  select(symbol, cluster_hclust = cluster, cluster_kmeans) |>
+  mutate(agree = if_else(cluster_hclust == cluster_kmeans, "✓ Agree", "✗ Differ")) |>
+  gt() |>
+  tab_header(
+    title    = "K-Means vs Hierarchical Cluster Assignments",
+    subtitle = paste("As of", format(last_train_date))
+  ) |>
+  cols_label(
+    symbol         = "ETF",
+    cluster_hclust = "Hierarchical",
+    cluster_kmeans = "K-Means",
+    agree          = "Agreement"
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = agree == "✓ Agree")
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#FFEBEE"),
+    locations = cells_body(rows = agree == "✗ Differ")
+  )
+```
+
+## 6.6 Cluster Stability Heatmap
 
 ```{r cluster-heatmap}
-# Visualise which cluster each ETF belongs to at each monthly rebalance.
-# Stable colours across time suggest robust, persistent behavioral groupings.
-
 cluster_history |>
   filter(date >= TRAIN_START, date <= TRAIN_END) |>
   mutate(cluster = factor(cluster)) |>
@@ -640,18 +698,16 @@ cluster_history |>
   scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
   labs(
     title    = "Cluster Assignments Over Time — Training Period",
-    subtitle = "Each cell = cluster label assigned at that month-end rebalance",
+    subtitle = "Each cell = hierarchical cluster label at that monthly rebalance",
     x = NULL, y = NULL
   ) +
   theme_minimal(base_size = 11) +
   theme(axis.text.x = element_text(angle = 30, hjust = 1))
 ```
 
-## 6.4 Example Dendrogram (Most Recent Training Month-End)
+## 6.7 Dendrogram (Most Recent Training Month-End)
 
 ```{r dendrogram}
-last_train_date <- max(train_month_ends)
-
 snap_last <- features_daily |>
   filter(date == last_train_date) |>
   select(symbol, all_of(CLUSTER_FEATURES)) |>
@@ -659,7 +715,6 @@ snap_last <- features_daily |>
 
 feat_last <- as.data.frame(select(snap_last, -symbol))
 rownames(feat_last) <- snap_last$symbol
-
 scaled_last <- standardize_features(feat_last)
 hc_last     <- hclust(dist(scaled_last), method = LINK_METHOD)
 
@@ -671,38 +726,117 @@ fviz_dend(
   rect       = TRUE,
   rect_fill  = TRUE,
   rect_lty   = 2,
-  main       = paste("Cluster Dendrogram at", format(last_train_date)),
+  horiz      = TRUE,
+  main       = paste("Cluster Dendrogram —", format(last_train_date)),
   sub        = paste0("Ward.D2 linkage | k = ", N_CLUSTERS, " clusters"),
-  xlab       = "", ylab = "Height"
+  xlab       = "Height", ylab = ""
 )
+```
+
+## 6.8 Cluster Summary Table
+
+Following the class notes — summarise cluster characteristics with color-coded gt table:
+
+```{r cluster-summary-table}
+# Compute summary stats per cluster at the most recent training date
+snap_summary <- features_daily |>
+  filter(date == last_train_date) |>
+  select(symbol, vol_20, vol_60, corr_spy_60, beta_spy_60, rel_ret_60, sharpe_60) |>
+  drop_na() |>
+  left_join(
+    cluster_history |> filter(date == last_train_date) |> select(symbol, cluster),
+    by = "symbol"
+  ) |>
+  filter(!is.na(cluster))
+
+snap_summary |>
+  group_by(cluster) |>
+  summarise(
+    n_sectors   = n(),
+    avg_vol20   = mean(vol_20),
+    avg_corr    = mean(corr_spy_60),
+    avg_beta    = mean(beta_spy_60),
+    avg_sharpe  = mean(sharpe_60, na.rm = TRUE),
+    sectors     = paste(symbol, collapse = ", "),
+    .groups     = "drop"
+  ) |>
+  gt() |>
+  tab_header(
+    title    = "Cluster Characteristics Summary",
+    subtitle = paste("Hierarchical, Ward.D2 | k =", N_CLUSTERS, "| as of", format(last_train_date))
+  ) |>
+  data_color(
+    columns = c(avg_vol20, avg_corr, avg_beta, avg_sharpe),
+    palette = c("red", "yellow", "green")
+  ) |>
+  fmt_percent(columns = avg_vol20, decimals = 1) |>
+  fmt_number(columns = c(avg_corr, avg_beta, avg_sharpe), decimals = 2) |>
+  fmt_integer(columns = n_sectors) |>
+  cols_label(
+    cluster    = "Cluster",
+    n_sectors  = "# ETFs",
+    avg_vol20  = "Ann. Vol (20d)",
+    avg_corr   = "Corr to SPY",
+    avg_beta   = "Beta to SPY",
+    avg_sharpe = "Rolling Sharpe",
+    sectors    = "Members"
+  )
+```
+
+## 6.9 Cluster Stability: Pre vs Post 2020
+
+Following class notes — compare cluster structure across market regimes:
+
+```{r cluster-stability}
+# Pre-2020 (excluding COVID) vs Post-2020 feature profiles
+pre_2020_date  <- month_ends_all[month_ends_all >= "2019-01-01" &
+                                  month_ends_all <= "2019-12-31"] |> max()
+post_2020_date <- month_ends_all[month_ends_all >= "2021-01-01" &
+                                  month_ends_all <= "2021-12-31"] |> max()
+
+make_regime_snap <- function(d, label) {
+  features_daily |>
+    filter(date == d) |>
+    select(symbol, vol_20, corr_spy_60) |>
+    drop_na() |>
+    mutate(period = label, date = d)
+}
+
+bind_rows(
+  make_regime_snap(pre_2020_date,  "Pre-COVID (2019)"),
+  make_regime_snap(post_2020_date, "Post-COVID (2021)")
+) |>
+  ggplot(aes(x = corr_spy_60, y = vol_20, color = period)) +
+  geom_point(size = 3.5, alpha = 0.8) +
+  geom_text(aes(label = symbol), vjust = -0.8, hjust = 0.5, size = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = c("Pre-COVID (2019)" = "#1565C0",
+                                "Post-COVID (2021)" = "#E65100")) +
+  facet_wrap(~ period) +
+  labs(
+    title    = "Cluster Stability Across Market Regimes",
+    subtitle = "Volatility vs SPY correlation — do sector groupings persist?",
+    x = "Rolling Correlation to SPY", y = "Ann. Volatility (20d)", color = NULL
+  ) +
+  theme_minimal(base_size = 11)
 ```
 
 ---
 
 # 7. Cluster-Relative Residual Construction
 
-The residual measures how far an ETF has deviated from its cluster peers over the past 60 trading days. It is the raw mean-reversion signal before Kalman smoothing.
-
-**Construction:**
+The residual measures how far an ETF has deviated from its cluster peers over 60 trading days. It is the raw mean-reversion signal before Kalman smoothing.
 
 $$\text{Residual}_{i,t} = \text{CumRet}_{60,i,t} - \underbrace{\frac{1}{|C_i| - 1} \sum_{j \in C_i, j \neq i} \text{CumRet}_{60,j,t}}_{\text{leave-one-out cluster mean}}$$
 
-Positive residual → ETF outperformed cluster → Short candidate
-Negative residual → ETF underperformed cluster → Long candidate
-
-**Leave-one-out** prevents the ETF's own return from inflating the benchmark, which matters most for small clusters.
-
 ```{r residual-construction}
 # ── Step 1: Carry cluster assignments forward to all daily dates ───────────────
-# Clusters are set at month-end and held until the next rebalance.
-# We join cluster labels to daily data and fill forward by symbol.
-
 symbol_dates <- features_daily |>
   filter(date >= TRAIN_START) |>
   distinct(date, symbol)
 
 cluster_daily <- symbol_dates |>
-  left_join(cluster_history, by = c("date", "symbol")) |>
+  left_join(cluster_history |> select(date, symbol, cluster), by = c("date", "symbol")) |>
   arrange(symbol, date) |>
   group_by(symbol) |>
   fill(cluster, .direction = "down") |>
@@ -715,24 +849,25 @@ residuals_daily <- features_daily |>
   left_join(cluster_daily, by = c("symbol", "date")) |>
   filter(!is.na(cluster), !is.na(cum_ret_60))
 
-# ── Step 3: Compute leave-one-out cluster mean ────────────────────────────────
+# ── Step 3: Leave-one-out cluster mean ───────────────────────────────────────
 residuals_daily <- residuals_daily |>
   group_by(date, cluster) |>
   mutate(
     cluster_sum = sum(cum_ret_60, na.rm = TRUE),
     cluster_n   = sum(!is.na(cum_ret_60)),
-    # Leave-one-out: remove self
     peer_mean   = (cluster_sum - cum_ret_60) / (cluster_n - 1L)
   ) |>
   ungroup() |>
   mutate(residual = cum_ret_60 - peer_mean)
 
-# Diagnostic: solo clusters produce NA peer_mean — flag them
 solo_count <- residuals_daily |> filter(cluster_n == 1L) |> nrow()
 cat("Solo cluster rows (peer_mean = NA):", solo_count, "\n")
-cat("Rows with valid residuals:", sum(!is.na(residuals_daily$residual)), "\n")
+cat("Valid residual rows:", sum(!is.na(residuals_daily$residual)), "\n")
+```
 
-# Summary statistics per ETF
+## 7.1 Residual Summary
+
+```{r residual-summary}
 residuals_daily |>
   filter(!is.na(residual), date >= TRAIN_START, date <= TRAIN_END) |>
   group_by(symbol) |>
@@ -741,20 +876,15 @@ residuals_daily |>
     sd_resid   = round(sd(residual), 4),
     min_resid  = round(min(residual), 4),
     max_resid  = round(max(residual), 4),
-    .groups = "drop"
+    .groups    = "drop"
   ) |>
   gt() |>
   tab_header(title = "Cluster-Relative Residual Summary — Training Period") |>
-  cols_label(
-    symbol    = "ETF",
-    mean_resid = "Mean",
-    sd_resid   = "Std Dev",
-    min_resid  = "Min",
-    max_resid  = "Max"
-  )
+  cols_label(symbol = "ETF", mean_resid = "Mean", sd_resid = "Std Dev",
+             min_resid = "Min", max_resid = "Max")
 ```
 
-## 7.1 Residual Time Series
+## 7.2 Residual Time Series
 
 ```{r residual-viz}
 residuals_daily |>
@@ -778,50 +908,38 @@ residuals_daily |>
 
 # 8. Kalman Filter
 
-The Kalman filter estimates a **smoothed latent fair-value state** from the noisy cluster-relative residual series. The model specification is a **local level model** (random walk plus noise):
+The Kalman filter estimates a **smoothed latent fair-value state** from the noisy residual series. The model is a **local level model** (random walk plus noise):
 
-$$\alpha_t = \alpha_{t-1} + \eta_t, \quad \eta_t \sim \mathcal{N}(0, Q) \quad \text{(state equation)}$$
-$$y_t = \alpha_t + \varepsilon_t, \quad \varepsilon_t \sim \mathcal{N}(0, R) \quad \text{(observation equation)}$$
+$$\alpha_t = \alpha_{t-1} + \eta_t, \quad \eta_t \sim \mathcal{N}(0, Q)$$
+$$y_t = \alpha_t + \varepsilon_t, \quad \varepsilon_t \sim \mathcal{N}(0, R)$$
 
-The **standardized innovation** is the trade signal:
-
-$$z_t = \frac{y_t - \hat{\alpha}_{t|t-1}}{\sqrt{F_t}}, \quad F_t = P_{t|t-1} + R$$
-
-Where $\hat{\alpha}_{t|t-1}$ is the **predicted** state (before observing $y_t$) and $F_t$ is the innovation variance. This z-score quantifies the model's "surprise" at time $t$ relative to its uncertainty, providing a naturally scaled signal across all ETFs.
+The **standardized innovation** $z_t = (y_t - \hat{\alpha}_{t|t-1}) / \sqrt{F_t}$ is the trade signal, measuring the model's "surprise" relative to its uncertainty. Per the class notes on mean-reversion and Kalman filter applications, the filter naturally identifies when deviations are large relative to the expected noise level.
 
 ## 8.1 Kalman Filter Implementation
 
 ```{r kalman-function}
 #' Local-level Kalman filter (sequential, causal)
 #'
-#' @param y  Numeric vector: observed residual series. NAs are propagated.
-#' @param Q  Process noise variance (controls state drift speed)
-#' @param R  Observation noise variance (controls smoothing strength)
-#'
-#' @return List: state (filtered), pred_state (predicted), pred_var (F_t),
-#'               innovation (v_t), z_score (standardised innovation)
+#' @param y  Numeric vector: observed residual series. NAs propagated.
+#' @param Q  Process noise variance (state drift speed)
+#' @param R  Observation noise variance (smoothing strength)
+#' @return List: state, pred_state, pred_var, innovation, z_score
 kalman_local_level <- function(y, Q = KF_Q, R = KF_R) {
   n        <- length(y)
-  state    <- numeric(n)    # filtered state estimate (after update)
-  P_filt   <- numeric(n)    # filtered variance
-  pred_st  <- numeric(n)    # predicted state (before update)
-  pred_var <- numeric(n)    # innovation variance F_t = P_pred + R
-  innov    <- numeric(n)    # innovation v_t = y_t - pred_state
-  z_score  <- numeric(n)    # standardised innovation
+  state    <- numeric(n)
+  P_filt   <- numeric(n)
+  pred_st  <- numeric(n)
+  pred_var <- numeric(n)
+  innov    <- numeric(n)
+  z_score  <- numeric(n)
 
-  # Initialise at first non-NA observation
   first_obs <- which(!is.na(y))[1L]
   if (is.na(first_obs)) {
-    return(list(
-      state      = rep(NA_real_, n),
-      pred_state = rep(NA_real_, n),
-      pred_var   = rep(NA_real_, n),
-      innovation = rep(NA_real_, n),
-      z_score    = rep(NA_real_, n)
-    ))
+    return(list(state = rep(NA_real_, n), pred_state = rep(NA_real_, n),
+                pred_var = rep(NA_real_, n), innovation = rep(NA_real_, n),
+                z_score = rep(NA_real_, n)))
   }
 
-  # Set pre-first-obs entries to NA
   if (first_obs > 1L) {
     state[seq_len(first_obs - 1L)]    <- NA_real_
     P_filt[seq_len(first_obs - 1L)]   <- NA_real_
@@ -832,20 +950,17 @@ kalman_local_level <- function(y, Q = KF_Q, R = KF_R) {
   }
 
   state[first_obs]    <- y[first_obs]
-  P_filt[first_obs]   <- R          # initialise uncertainty at observation noise level
+  P_filt[first_obs]   <- R
   pred_st[first_obs]  <- y[first_obs]
   pred_var[first_obs] <- R + Q
   innov[first_obs]    <- 0
   z_score[first_obs]  <- 0
 
-  # Sequential Kalman updates
   for (t in seq(first_obs + 1L, n)) {
-    # Prediction step
     a_pred <- state[t - 1L]
     P_pred <- P_filt[t - 1L] + Q
 
     if (is.na(y[t])) {
-      # Missing observation: propagate prediction without update
       state[t]    <- a_pred
       P_filt[t]   <- P_pred
       pred_st[t]  <- a_pred
@@ -853,37 +968,28 @@ kalman_local_level <- function(y, Q = KF_Q, R = KF_R) {
       innov[t]    <- NA_real_
       z_score[t]  <- NA_real_
     } else {
-      # Update step
-      F_t         <- P_pred + R            # innovation variance
-      v_t         <- y[t] - a_pred         # innovation
-      K_t         <- P_pred / F_t          # Kalman gain
+      F_t         <- P_pred + R
+      v_t         <- y[t] - a_pred
+      K_t         <- P_pred / F_t
 
-      state[t]    <- a_pred + K_t * v_t   # filtered state
-      P_filt[t]   <- (1 - K_t) * P_pred   # filtered variance
+      state[t]    <- a_pred + K_t * v_t
+      P_filt[t]   <- (1 - K_t) * P_pred
       pred_st[t]  <- a_pred
       pred_var[t] <- F_t
       innov[t]    <- v_t
-      z_score[t]  <- v_t / sqrt(F_t)      # standardised innovation
+      z_score[t]  <- v_t / sqrt(F_t)
     }
   }
 
-  list(
-    state      = state,
-    pred_state = pred_st,
-    pred_var   = pred_var,
-    innovation = innov,
-    z_score    = z_score
-  )
+  list(state = state, pred_state = pred_st, pred_var = pred_var,
+       innovation = innov, z_score = z_score)
 }
 ```
 
 ## 8.2 Apply Kalman Filter to All ETF Residuals
 
 ```{r apply-kalman}
-# The filter runs sequentially over the full sample (train + test).
-# At each step it only uses past information — strictly causal.
-# Running continuously avoids restarting the filter state at the test boundary.
-
+# Filter runs sequentially over full sample (train + test) — strictly causal.
 cat("Applying Kalman filter to", n_distinct(residuals_daily$symbol), "ETF residuals...\n")
 
 kalman_results <- residuals_daily |>
@@ -892,53 +998,40 @@ kalman_results <- residuals_daily |>
   group_by(symbol) |>
   group_modify(~ {
     kf <- kalman_local_level(.x$residual, Q = KF_Q, R = KF_R)
-    mutate(.x,
-      kf_state   = kf$state,
-      kf_pred_st = kf$pred_state,
-      kf_pred_var = kf$pred_var,
-      kf_innov   = kf$innovation,
-      kf_z       = kf$z_score
-    )
+    mutate(.x, kf_state = kf$state, kf_pred_st = kf$pred_state,
+           kf_pred_var = kf$pred_var, kf_innov = kf$innovation, kf_z = kf$z_score)
   }) |>
   ungroup()
 
-cat("Kalman filter applied.\n")
-cat("Rows with valid z-scores:", sum(!is.na(kalman_results$kf_z)), "\n")
+cat("Kalman filter applied. Valid z-scores:", sum(!is.na(kalman_results$kf_z)), "\n")
 ```
 
 ## 8.3 Kalman Filter Diagnostics
 
 ```{r kalman-viz}
-# Plot observed residual vs Kalman filtered state for selected ETFs
+# Observed vs filtered state for selected ETFs
 selected_etfs <- c("XLE", "XLK", "XLF", "XLU")
 
 kalman_results |>
   filter(symbol %in% selected_etfs, date >= TRAIN_START, date <= TRAIN_END) |>
-  pivot_longer(
-    cols      = c(residual, kf_state, kf_pred_st),
-    names_to  = "series",
-    values_to = "value"
-  ) |>
-  mutate(series = recode(series,
-    residual   = "Observed Residual",
-    kf_state   = "Kalman Filtered State",
-    kf_pred_st = "Predicted State"
-  )) |>
+  pivot_longer(c(residual, kf_state, kf_pred_st),
+               names_to = "series", values_to = "value") |>
+  mutate(series = recode(series, residual = "Observed Residual",
+                         kf_state = "Kalman Filtered State",
+                         kf_pred_st = "Predicted State")) |>
   ggplot(aes(x = date, y = value, color = series, alpha = series)) +
   geom_line(linewidth = 0.45) +
   geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.3) +
   scale_color_manual(values = c("grey55", "#1565C0", "#E53935")) +
   scale_alpha_manual(values = c(0.4, 0.95, 0.7), guide = "none") +
   facet_wrap(~ symbol, ncol = 2, scales = "free_y") +
-  labs(
-    title    = "Kalman Filter: Observed Residual vs Smoothed Fair-Value State",
-    subtitle = "Blue = filtered state (fair value) | Grey = observed residual | Red = predicted state",
-    x = NULL, y = "Residual", color = NULL
-  ) +
+  labs(title = "Kalman Filter: Observed Residual vs Smoothed Fair-Value State",
+       subtitle = "Blue = filtered state | Grey = observed | Red = predicted",
+       x = NULL, y = "Residual", color = NULL) +
   theme_minimal(base_size = 11) +
   theme(legend.position = "bottom")
 
-# Distribution of standardised innovations (should approximate N(0,1) if well-specified)
+# Innovation distribution — should approximate N(0,1) if well-specified
 kalman_results |>
   filter(date >= TRAIN_START, date <= TRAIN_END, !is.na(kf_z)) |>
   ggplot(aes(x = kf_z)) +
@@ -947,11 +1040,10 @@ kalman_results |>
   stat_function(fun = dnorm, color = "#E53935", linewidth = 1) +
   geom_vline(xintercept = c(-SIGNAL_THRESHOLD, SIGNAL_THRESHOLD),
              linetype = "dashed", color = "#FF8F00", linewidth = 0.9) +
-  labs(
-    title    = "Distribution of Kalman Standardised Innovations — Training Period",
-    subtitle = paste0("Orange dashed = ±", SIGNAL_THRESHOLD, " threshold | Red = N(0,1)"),
-    x = "z-score", y = "Density"
-  ) +
+  labs(title = "Distribution of Kalman Standardised Innovations — Training Period",
+       subtitle = paste0("Orange dashed = ±", SIGNAL_THRESHOLD,
+                         " threshold | Red = N(0,1)"),
+       x = "z-score", y = "Density") +
   theme_minimal(base_size = 11)
 ```
 
@@ -959,33 +1051,26 @@ kalman_results |>
 
 # 9. Signal Generation
 
-The Kalman z-score at each month-end rebalance date is the trade signal. Decision rules are explicit, systematic, and applied uniformly at every rebalance.
-
-## Decision Rules
+The Kalman z-score at each month-end is the trade signal. Decision rules are explicit and applied uniformly.
 
 | Condition | Signal | Interpretation |
 |---|---|---|
-| $z < -\tau$ | **LONG** | ETF below Kalman fair value — expect reversion upward |
-| $z > +\tau$ | **SHORT** | ETF above Kalman fair value — expect reversion downward |
+| $z < -\tau$ | **LONG** | ETF below Kalman fair value — expect mean reversion upward |
+| $z > +\tau$ | **SHORT** | ETF above Kalman fair value — expect mean reversion downward |
 | $|z| < \tau$ | **NEUTRAL** | Deviation too small; margin of safety not met |
 
-where $\tau =$ `SIGNAL_THRESHOLD` = `r SIGNAL_THRESHOLD`.
-
 ```{r signal-generation}
-# Snapshot z-scores at each monthly rebalance date
 signals_monthly <- kalman_results |>
   filter(date %in% all_month_ends, !is.na(kf_z)) |>
   select(date, symbol, residual, kf_state, kf_z, cluster) |>
   arrange(date, desc(abs(kf_z))) |>
-  mutate(
-    signal = case_when(
-      kf_z < -SIGNAL_THRESHOLD ~ "LONG",
-      kf_z >  SIGNAL_THRESHOLD ~ "SHORT",
-      TRUE                     ~ "NEUTRAL"
-    )
-  )
+  mutate(signal = case_when(
+    kf_z < -SIGNAL_THRESHOLD ~ "LONG",
+    kf_z >  SIGNAL_THRESHOLD ~ "SHORT",
+    TRUE                     ~ "NEUTRAL"
+  ))
 
-# Signal distribution (training period)
+# Signal distribution (training)
 signals_monthly |>
   filter(date >= TRAIN_START, date <= TRAIN_END) |>
   count(signal) |>
@@ -1003,11 +1088,9 @@ signals_monthly |>
   geom_col(position = "stack", width = 25) +
   scale_fill_manual(values = c(LONG = "#4CAF50", NEUTRAL = "#9E9E9E", SHORT = "#E53935")) +
   scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
-  labs(
-    title    = "Signal Count per Rebalance Date — Training Period",
-    subtitle = paste("Signal threshold |z| ≥", SIGNAL_THRESHOLD),
-    x = NULL, y = "Number of ETFs", fill = "Signal"
-  ) +
+  labs(title = "Signal Count per Rebalance Date — Training Period",
+       subtitle = paste("Threshold |z| ≥", SIGNAL_THRESHOLD),
+       x = NULL, y = "Number of ETFs", fill = "Signal") +
   theme_minimal(base_size = 11)
 ```
 
@@ -1015,33 +1098,14 @@ signals_monthly |>
 
 # 10. Portfolio Construction
 
-At each month-end rebalance:
-
-1. Filter to ETFs with LONG or SHORT signals (|z| ≥ τ)
-2. Select up to `MAX_LONGS` ETFs with the **most negative** z-scores (strongest underperformers relative to cluster)
-3. Select up to `MAX_SHORTS` ETFs with the **most positive** z-scores (strongest outperformers)
-4. Assign **equal weights** within each side
-5. If no signals pass the threshold, take no position (go to cash)
-
-**Weight convention**: Long weights are positive, short weights are negative. The strategy is a long-short portfolio with no leverage constraint imposed.
-
 ```{r portfolio-construction}
-# ── Position builder ───────────────────────────────────────────────────────────
+# ── Position builder ──────────────────────────────────────────────────────────
 build_positions <- function(signals_df,
                             max_longs  = MAX_LONGS,
                             max_shorts = MAX_SHORTS) {
-  longs  <- signals_df |>
-    filter(signal == "LONG")  |>
-    arrange(kf_z) |>
-    head(max_longs)
-
-  shorts <- signals_df |>
-    filter(signal == "SHORT") |>
-    arrange(desc(kf_z)) |>
-    head(max_shorts)
-
-  n_long  <- nrow(longs)
-  n_short <- nrow(shorts)
+  longs  <- signals_df |> filter(signal == "LONG")  |> arrange(kf_z)        |> head(max_longs)
+  shorts <- signals_df |> filter(signal == "SHORT") |> arrange(desc(kf_z))  |> head(max_shorts)
+  n_long <- nrow(longs); n_short <- nrow(shorts)
 
   bind_rows(
     if (n_long  > 0) mutate(longs,  weight =  1 / n_long)  else tibble(),
@@ -1050,28 +1114,24 @@ build_positions <- function(signals_df,
     select(date, symbol, signal, kf_z, cluster, weight)
 }
 
-# Apply to all rebalance dates
 positions_all <- signals_monthly |>
   group_by(date) |>
   group_modify(~ build_positions(.x)) |>
   ungroup()
 
-# Summary statistics
+# Portfolio exposure summary
 pos_summary <- positions_all |>
   group_by(date) |>
-  summarise(
-    n_long  = sum(signal == "LONG"),
-    n_short = sum(signal == "SHORT"),
-    gross   = sum(abs(weight)),
-    net     = sum(weight),
-    .groups = "drop"
-  )
+  summarise(n_long  = sum(signal == "LONG"),
+            n_short = sum(signal == "SHORT"),
+            gross   = sum(abs(weight)),
+            net     = sum(weight), .groups = "drop")
 
-cat("Average longs per month  :", round(mean(pos_summary$n_long), 1), "\n")
-cat("Average shorts per month :", round(mean(pos_summary$n_short), 1), "\n")
+cat("Avg longs per month  :", round(mean(pos_summary$n_long), 1), "\n")
+cat("Avg shorts per month :", round(mean(pos_summary$n_short), 1), "\n")
 cat("Months with no positions :", sum(pos_summary$gross == 0), "\n")
 
-# Gross and net exposure over time
+# Gross/net exposure chart
 pos_summary |>
   filter(date >= TRAIN_START) |>
   pivot_longer(c(gross, net), names_to = "type", values_to = "exposure") |>
@@ -1081,11 +1141,9 @@ pos_summary |>
   geom_vline(xintercept = TEST_START, linetype = "dotted", color = "black") +
   scale_color_manual(values = c(gross = "#1565C0", net = "#E53935")) +
   scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
-  labs(
-    title    = "Portfolio Gross and Net Exposure per Rebalance",
-    subtitle = "Vertical dotted line = start of testing period",
-    x = NULL, y = "Exposure", color = "Type"
-  ) +
+  labs(title = "Portfolio Gross and Net Exposure per Rebalance",
+       subtitle = "Dotted = start of testing period",
+       x = NULL, y = "Exposure", color = "Type") +
   theme_minimal(base_size = 11)
 ```
 
@@ -1096,10 +1154,6 @@ pos_summary |>
 ## 11.1 Monthly Returns
 
 ```{r monthly-returns}
-# Compute month-end adjusted prices to derive close-to-close monthly returns.
-# The return for "month t" = close[last day of month t] / close[last day of month t-1] - 1.
-# This matches the execution assumption exactly.
-
 monthly_prices <- prices |>
   filter(date %in% month_ends_all) |>
   arrange(symbol, date)
@@ -1117,57 +1171,67 @@ cat("Monthly returns computed for", n_distinct(monthly_ret_tbl$symbol), "symbols
 ## 11.2 Strategy Return Calculation
 
 ```{r backtest}
-# Execution timing:
-# Signal at month-end date d  →  position held during month d+1
-# Return(d+1) = position formed at close of d, measured to close of d+1.
-
-# Map: signal date → return date (next month-end)
+# Signal at month-end d → position held in following month d+1.
+# Return(d+1) = strategy weighted ETF returns from close d to close d+1.
 next_month_map <- tibble(
   signal_date = all_month_ends[-length(all_month_ends)],
   return_date = all_month_ends[-1]
 )
 
-# Compute strategy return for each month
 strategy_returns_raw <- positions_all |>
   rename(signal_date = date) |>
   left_join(next_month_map, by = "signal_date") |>
   filter(!is.na(return_date)) |>
-  left_join(
-    monthly_ret_tbl |> select(symbol, return_date = date, monthly_ret),
-    by = c("symbol", "return_date")
-  ) |>
+  left_join(monthly_ret_tbl |> select(symbol, return_date = date, monthly_ret),
+            by = c("symbol", "return_date")) |>
   filter(!is.na(monthly_ret)) |>
   group_by(return_date) |>
-  summarise(
-    strategy_ret = sum(weight * monthly_ret, na.rm = TRUE),
-    n_positions  = n(),
-    .groups = "drop"
-  )
+  summarise(strategy_ret = sum(weight * monthly_ret, na.rm = TRUE),
+            n_positions  = n(), .groups = "drop")
 
-# Fill in months where no positions were taken (return = 0)
 all_return_months <- tibble(return_date = all_month_ends[-1])
-
 strategy_returns <- all_return_months |>
   left_join(strategy_returns_raw, by = "return_date") |>
-  mutate(
-    strategy_ret = replace_na(strategy_ret, 0),
-    n_positions  = replace_na(n_positions, 0)
-  ) |>
+  mutate(strategy_ret = replace_na(strategy_ret, 0),
+         n_positions  = replace_na(n_positions, 0)) |>
   filter(return_date >= TRAIN_START)
 
-# Benchmark: SPY monthly returns
 spy_monthly <- monthly_ret_tbl |>
   filter(symbol == "SPY") |>
   select(return_date = date, spy_ret = monthly_ret)
 
-# Combine into backtest data frame
 backtest_df <- strategy_returns |>
   left_join(spy_monthly, by = "return_date") |>
   filter(!is.na(spy_ret)) |>
   mutate(period = if_else(return_date <= TRAIN_END, "Training", "Testing"))
 
-cat("Backtest months — Training:", sum(backtest_df$period == "Training"), "\n")
-cat("Backtest months — Testing :", sum(backtest_df$period == "Testing"), "\n")
+cat("Training months:", sum(backtest_df$period == "Training"), "\n")
+cat("Testing  months:", sum(backtest_df$period == "Testing"), "\n")
+```
+
+## 11.3 Strategy Chart (Price, Positions, Cumulative Equity)
+
+Following the class notes — convert to xts and use multi-panel chart:
+
+```{r strategy-chart}
+# Build monthly xts of strategy and SPY returns
+backtest_xts <- backtest_df |>
+  select(return_date, strategy_ret, spy_ret) |>
+  mutate(cum_strat = cumprod(1 + strategy_ret),
+         cum_spy   = cumprod(1 + spy_ret)) |>
+  timetk::tk_xts(date_var = return_date)
+
+# Plot cumulative equity (course-style xts chart)
+plot(backtest_xts$cum_strat,
+     main  = "Cumulative Equity — Strategy vs SPY",
+     col   = "#1565C0",
+     ylab  = "Growth of $1")
+xts::addSeries(backtest_xts$cum_spy,
+     main = "SPY", on = NA,
+     type = "l", col = "#E65100", lty = 2, lwd = 1.5, pch = 0)
+xts::addSeries(backtest_xts$strategy_ret,
+     main = "Monthly Return", on = NA,
+     type = "h", col = "#1565C0", lty = 1, lwd = 1, pch = 0)
 ```
 
 ---
@@ -1185,91 +1249,120 @@ backtest_df |>
   ungroup() |>
   mutate(series = recode(series,
     strategy_ret = "Strategy — Cluster Mean Reversion",
-    spy_ret      = "SPY Benchmark"
-  )) |>
+    spy_ret      = "SPY Benchmark")) |>
   ggplot(aes(x = return_date, y = cum_ret, color = series, linetype = series)) +
   geom_line(linewidth = 0.9) +
-  geom_vline(xintercept = TEST_START,
-             linetype = "dotted", color = "black", linewidth = 0.7) +
+  geom_vline(xintercept = TEST_START, linetype = "dotted",
+             color = "black", linewidth = 0.7) +
   annotate("text", x = TEST_START + 20, y = -0.05,
            label = "← Training  |  Testing →", size = 3.2, hjust = 0, color = "grey30") +
   scale_y_continuous(labels = percent_format(accuracy = 1)) +
   scale_color_manual(values = c("#1565C0", "#E65100")) +
   scale_linetype_manual(values = c("solid", "dashed")) +
-  labs(
-    title    = "Cumulative Returns: Strategy vs SPY Benchmark",
-    subtitle = "Signal at month-end close; return measured over following calendar month",
-    x = NULL, y = "Cumulative Return", color = NULL, linetype = NULL
-  ) +
+  labs(title = "Cumulative Returns: Strategy vs SPY Benchmark",
+       x = NULL, y = "Cumulative Return", color = NULL, linetype = NULL) +
   theme_minimal(base_size = 11) +
   theme(legend.position = "bottom")
 ```
 
-## 12.2 Drawdown Analysis
+## 12.2 Drawdown Analysis — PerformanceAnalytics
 
-```{r drawdown}
-compute_drawdown <- function(ret_vec) {
-  cum <- cumprod(1 + ret_vec)
-  (cum - cummax(cum)) / cummax(cum)
-}
+Following the class notes — use PerformanceAnalytics for drawdown charts and top drawdown tables:
 
-backtest_df <- backtest_df |>
-  mutate(
-    dd_strategy = compute_drawdown(strategy_ret),
-    dd_spy      = compute_drawdown(spy_ret)
+```{r drawdown-pa}
+# Convert strategy and SPY returns to xts for PerformanceAnalytics
+strat_xts <- backtest_df |>
+  select(return_date, strategy_ret) |>
+  timetk::tk_xts(date_var = return_date)
+
+spy_xts <- backtest_df |>
+  select(return_date, spy_ret) |>
+  timetk::tk_xts(date_var = return_date)
+
+# PerformanceAnalytics drawdown chart
+PerformanceAnalytics::chart.Drawdown(
+  cbind(strat_xts, spy_xts),
+  legend.loc = "bottomleft",
+  main       = "Drawdown: Strategy vs SPY",
+  colorset   = c("#1565C0", "#E65100"),
+  ylab       = "Drawdown"
+)
+
+# Top drawdowns table (class notes style: table.Drawdowns)
+cat("\n--- Top 10 Strategy Drawdowns ---\n")
+PerformanceAnalytics::table.Drawdowns(strat_xts, top = 10)
+```
+
+## 12.3 Correlation to Underlying (SPY)
+
+From the class notes: when ρ = 1, strategy equals long buy-and-hold; ρ = -1 equals short. Values between reveal the strategy's independence from SPY.
+
+```{r correlation-chart}
+strat_vs_spy <- cbind(strat_xts, spy_xts)
+colnames(strat_vs_spy) <- c("Strategy", "SPY")
+
+PerformanceAnalytics::chart.Correlation(
+  strat_vs_spy,
+  histogram = TRUE,
+  main      = "Strategy vs SPY — Return Correlation"
+)
+```
+
+## 12.4 tradeStats — Full Performance Summary
+
+Mirroring the `RTL::tradeStats()` format from the class notes: CumReturn, Ret.Ann, SD.Ann, Sharpe, Omega, %.Win, %.InMrkt, DD.Max, DD.Length.
+
+```{r trade-stats-function}
+# Custom tradeStats function matching RTL::tradeStats() output format
+trade_stats <- function(ret_vec, rf = 0) {
+  r       <- ret_vec[!is.na(ret_vec)]
+  n       <- length(r)
+  if (n < 3L) return(tibble())
+
+  cum_ret  <- prod(1 + r) - 1
+  ret_ann  <- prod(1 + r)^(12 / n) - 1
+  sd_ann   <- sd(r) * sqrt(12)
+  sharpe   <- (ret_ann - rf) / sd_ann
+
+  # Omega (MAR = 0, matching class notes)
+  MAR       <- 0
+  gains     <- r[r > MAR]
+  losses    <- r[r <= MAR]
+  omega     <- if (length(losses) > 0 && sum(abs(losses)) > 0)
+                 sum(gains - MAR) / sum(MAR - losses) else Inf
+
+  pct_win   <- mean(r > 0)
+  pct_in_mkt <- mean(r != 0)
+
+  # Max drawdown depth and length
+  cum_growth <- cumprod(1 + r)
+  running_max <- cummax(cum_growth)
+  dd          <- (cum_growth - running_max) / running_max
+  dd_max      <- min(dd)
+
+  # Drawdown length: max consecutive periods below peak
+  below_peak <- dd < 0
+  dd_lengths <- rle(below_peak)
+  dd_length  <- if (any(dd_lengths$values)) max(dd_lengths$lengths[dd_lengths$values]) else 0L
+
+  tibble(
+    CumReturn  = cum_ret,
+    Ret.Ann    = ret_ann,
+    SD.Ann     = sd_ann,
+    Sharpe     = sharpe,
+    Omega      = omega,
+    `%.Win`    = pct_win,
+    `%.InMrkt` = pct_in_mkt,
+    DD.Length  = dd_length,
+    DD.Max     = dd_max,
+    N.Months   = n
   )
-
-backtest_df |>
-  select(return_date, dd_strategy, dd_spy) |>
-  pivot_longer(-return_date, names_to = "series", values_to = "dd") |>
-  mutate(series = recode(series, dd_strategy = "Strategy", dd_spy = "SPY")) |>
-  ggplot(aes(x = return_date, y = dd, fill = series)) +
-  geom_area(alpha = 0.55, position = "identity") +
-  geom_vline(xintercept = TEST_START, linetype = "dotted", color = "black", linewidth = 0.7) +
-  scale_y_continuous(labels = percent_format(accuracy = 1)) +
-  scale_fill_manual(values = c(Strategy = "#1565C0", SPY = "#E65100")) +
-  labs(
-    title = "Drawdown: Strategy vs SPY",
-    x = NULL, y = "Drawdown (%)", fill = NULL
-  ) +
-  theme_minimal(base_size = 11) +
-  theme(legend.position = "bottom")
+}
 ```
 
-## 12.3 Risk-Adjusted Performance Metrics
-
-```{r perf-metrics}
-# ── Performance calculation function ──────────────────────────────────────────
-calc_metrics <- function(returns, rf_monthly = 0) {
-  returns  <- returns[!is.na(returns)]
-  n_months <- length(returns)
-
-  if (n_months < 3L) {
-    return(tibble(ann_ret = NA, ann_vol = NA, sharpe = NA,
-                  max_dd = NA, omega = NA, hit_rate = NA,
-                  calmar = NA, n_months = n_months))
-  }
-
-  ann_ret  <- prod(1 + returns)^(12 / n_months) - 1
-  ann_vol  <- sd(returns) * sqrt(12)
-  sharpe   <- (ann_ret - rf_monthly * 12) / ann_vol
-
-  cum      <- cumprod(1 + returns)
-  max_dd   <- min((cum - cummax(cum)) / cummax(cum))
-
-  gains    <- returns[returns > 0]
-  losses   <- returns[returns <= 0]
-  omega    <- if (length(losses) > 0 && sum(abs(losses)) > 0)
-                sum(gains) / sum(abs(losses)) else Inf
-
-  hit_rate <- mean(returns > 0)
-  calmar   <- if (max_dd != 0) ann_ret / abs(max_dd) else NA_real_
-
-  tibble(ann_ret, ann_vol, sharpe, max_dd, omega, hit_rate, calmar, n_months)
-}
-
+```{r trade-stats-output}
 # Compute for all period / series combinations
-metrics_list <- list(
+stats_list <- list(
   "Strategy — Training" = filter(backtest_df, period == "Training")$strategy_ret,
   "Strategy — Testing"  = filter(backtest_df, period == "Testing")$strategy_ret,
   "Strategy — Full"     = backtest_df$strategy_ret,
@@ -1278,38 +1371,56 @@ metrics_list <- list(
   "SPY — Full"          = backtest_df$spy_ret
 )
 
-metrics_tbl <- purrr::imap_dfr(metrics_list, ~ {
-  m <- calc_metrics(.x)
-  mutate(m, period = .y, .before = 1)
-})
+stats_tbl <- purrr::imap_dfr(stats_list, ~ mutate(trade_stats(.x), Period = .y, .before = 1))
 
-metrics_tbl |>
+stats_tbl |>
   gt() |>
   tab_header(
-    title    = "Performance Summary",
-    subtitle = "Annualised metrics from monthly returns"
+    title    = "Performance Summary — tradeStats",
+    subtitle = "Monthly returns | annualised metrics | matching class notes format"
   ) |>
-  fmt_percent(columns = c(ann_ret, ann_vol, max_dd, hit_rate), decimals = 1) |>
-  fmt_number(columns  = c(sharpe, omega, calmar), decimals = 2) |>
-  fmt_integer(columns = n_months) |>
-  cols_label(
-    period   = "Period",
-    ann_ret  = "Ann. Return",
-    ann_vol  = "Ann. Volatility",
-    sharpe   = "Sharpe",
-    max_dd   = "Max Drawdown",
-    omega    = "Omega",
-    hit_rate = "Hit Rate",
-    calmar   = "Calmar",
-    n_months = "Months"
-  ) |>
+  fmt_percent(columns = c(CumReturn, Ret.Ann, SD.Ann, `%.Win`, `%.InMrkt`, DD.Max),
+              decimals = 1) |>
+  fmt_number(columns  = c(Sharpe, Omega), decimals = 2) |>
+  fmt_integer(columns = c(DD.Length, N.Months)) |>
   tab_style(
     style     = cell_fill(color = "#E3F2FD"),
-    locations = cells_body(rows = grepl("Strategy", period))
+    locations = cells_body(rows = grepl("Strategy", Period))
+  ) |>
+  cols_label(
+    Period     = "Series",
+    CumReturn  = "Cum Return",
+    Ret.Ann    = "Ann. Return",
+    SD.Ann     = "Ann. Vol",
+    Sharpe     = "Sharpe",
+    Omega      = "Omega",
+    `%.Win`    = "% Win",
+    `%.InMrkt` = "% In Mkt",
+    DD.Length  = "DD Length",
+    DD.Max     = "DD Max",
+    N.Months   = "Months"
   )
 ```
 
-## 12.4 Rolling 12-Month Sharpe Ratio
+## 12.5 Sharpe and Omega via PerformanceAnalytics
+
+```{r pa-metrics}
+# PerformanceAnalytics versions (matching class notes)
+cat("=== Strategy - Training Period ===\n")
+train_xts <- strat_xts[index(strat_xts) <= TRAIN_END]
+
+cat("Sharpe Ratio:\n")
+print(PerformanceAnalytics::SharpeRatio(train_xts))
+
+cat("\nOmega Sharpe Ratio (MAR = 0):\n")
+print(PerformanceAnalytics::OmegaSharpeRatio(train_xts, MAR = 0))
+
+cat("\n=== Strategy - Testing Period ===\n")
+test_xts <- strat_xts[index(strat_xts) >= TEST_START]
+print(PerformanceAnalytics::SharpeRatio(test_xts))
+```
+
+## 12.6 Rolling 12-Month Sharpe
 
 ```{r rolling-sharpe}
 backtest_df <- backtest_df |>
@@ -1317,13 +1428,11 @@ backtest_df <- backtest_df |>
     roll_sharpe_strat = slider::slide_dbl(
       strategy_ret,
       ~ if (sd(.x) == 0) NA_real_ else mean(.x) / sd(.x) * sqrt(12),
-      .before = 11L, .complete = TRUE
-    ),
+      .before = 11L, .complete = TRUE),
     roll_sharpe_spy = slider::slide_dbl(
       spy_ret,
       ~ if (sd(.x) == 0) NA_real_ else mean(.x) / sd(.x) * sqrt(12),
-      .before = 11L, .complete = TRUE
-    )
+      .before = 11L, .complete = TRUE)
   )
 
 backtest_df |>
@@ -1331,28 +1440,23 @@ backtest_df |>
   select(return_date, roll_sharpe_strat, roll_sharpe_spy) |>
   pivot_longer(-return_date, names_to = "series", values_to = "sharpe") |>
   mutate(series = recode(series,
-    roll_sharpe_strat = "Strategy",
-    roll_sharpe_spy   = "SPY"
-  )) |>
+    roll_sharpe_strat = "Strategy", roll_sharpe_spy = "SPY")) |>
   ggplot(aes(x = return_date, y = sharpe, color = series)) +
   geom_line(linewidth = 0.7) +
   geom_hline(yintercept = 0, linetype = "dashed") +
   geom_hline(yintercept = 1, linetype = "dotted", color = "grey50") +
-  geom_vline(xintercept = TEST_START, linetype = "dotted", color = "black", linewidth = 0.7) +
+  geom_vline(xintercept = TEST_START, linetype = "dotted", color = "black") +
   scale_color_manual(values = c(Strategy = "#1565C0", SPY = "#E65100")) +
-  labs(
-    title    = "12-Month Rolling Sharpe Ratio",
-    subtitle = "Dotted horizontal line = Sharpe of 1",
-    x = NULL, y = "Sharpe (annualised)", color = NULL
-  ) +
+  labs(title = "12-Month Rolling Sharpe Ratio",
+       x = NULL, y = "Sharpe (annualised)", color = NULL) +
   theme_minimal(base_size = 11) +
   theme(legend.position = "bottom")
 ```
 
-## 12.5 Trade Analysis
+## 12.7 Trade Analysis
 
 ```{r trade-analysis}
-# Monthly turnover: average fraction of portfolio changed at each rebalance
+# Turnover
 turnover_df <- positions_all |>
   arrange(symbol, date) |>
   group_by(symbol) |>
@@ -1361,21 +1465,18 @@ turnover_df <- positions_all |>
   group_by(date) |>
   summarise(
     turnover = sum(abs(replace_na(weight, 0) - replace_na(weight_lag, 0))) / 2,
-    .groups  = "drop"
-  )
+    .groups  = "drop")
 
-cat("Average monthly one-way turnover:",
+cat("Avg monthly one-way turnover:",
     percent(mean(turnover_df$turnover, na.rm = TRUE), accuracy = 0.1), "\n")
 
-# Win/loss analysis per signal direction
+# Win/loss by signal direction
 position_returns_detail <- positions_all |>
   rename(signal_date = date) |>
   left_join(next_month_map, by = "signal_date") |>
   filter(!is.na(return_date)) |>
-  left_join(
-    monthly_ret_tbl |> select(symbol, return_date = date, monthly_ret),
-    by = c("symbol", "return_date")
-  ) |>
+  left_join(monthly_ret_tbl |> select(symbol, return_date = date, monthly_ret),
+            by = c("symbol", "return_date")) |>
   filter(!is.na(monthly_ret)) |>
   mutate(pnl = weight * monthly_ret, won = pnl > 0)
 
@@ -1395,58 +1496,47 @@ position_returns_detail |>
   fmt_integer(columns = n_trades) |>
   fmt_number(columns = c(hit_rate, avg_pnl_pct, med_pnl_pct, best_pct, worst_pct),
              decimals = 2) |>
-  cols_label(
-    signal      = "Signal",
-    n_trades    = "# Trades",
-    hit_rate    = "Hit Rate %",
-    avg_pnl_pct = "Avg P&L %",
-    med_pnl_pct = "Median P&L %",
-    best_pct    = "Best Trade %",
-    worst_pct   = "Worst Trade %"
-  )
+  cols_label(signal = "Signal", n_trades = "# Trades", hit_rate = "Hit Rate %",
+             avg_pnl_pct = "Avg P&L %", med_pnl_pct = "Median P&L %",
+             best_pct = "Best %", worst_pct = "Worst %")
 
-# Monthly return distribution by period
+# Return distribution
 backtest_df |>
   ggplot(aes(x = strategy_ret, fill = period)) +
-  geom_histogram(bins = 40, alpha = 0.75, position = "identity", color = "white", linewidth = 0.1) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40, alpha = 0.75,
+                 position = "identity", color = "white", linewidth = 0.1) +
+  stat_function(fun = dnorm,
+                args = list(mean = mean(backtest_df$strategy_ret),
+                            sd   = sd(backtest_df$strategy_ret)),
+                color = "red", linewidth = 1) +
   geom_vline(xintercept = 0, linetype = "dashed") +
   scale_fill_manual(values = c(Training = "#1565C0", Testing = "#E65100")) +
   scale_x_continuous(labels = percent_format(accuracy = 1)) +
-  labs(
-    title    = "Monthly Return Distribution — Strategy",
-    subtitle = "Training vs testing comparison",
-    x = "Monthly Return", y = "Count", fill = "Period"
-  ) +
+  labs(title = "Monthly Return Distribution — Strategy (vs Normal)",
+       subtitle = "Can you tell why Omega differs from Sharpe here?",
+       x = "Monthly Return", y = "Density", fill = "Period") +
   theme_minimal(base_size = 11)
 ```
 
-## 12.6 Training vs Testing Period Comparison
+## 12.8 Training vs Testing Comparison
 
 ```{r train-test-comparison}
-# Cumulative return within each period separately (rebased to 0 at period start)
 backtest_df |>
   select(return_date, period, strategy_ret, spy_ret) |>
   group_by(period) |>
-  mutate(
-    cum_strat = cumprod(1 + strategy_ret) - 1,
-    cum_spy   = cumprod(1 + spy_ret) - 1
-  ) |>
+  mutate(cum_strat = cumprod(1 + strategy_ret) - 1,
+         cum_spy   = cumprod(1 + spy_ret) - 1) |>
   ungroup() |>
   pivot_longer(c(cum_strat, cum_spy), names_to = "series", values_to = "cum_ret") |>
-  mutate(series = recode(series,
-    cum_strat = "Strategy",
-    cum_spy   = "SPY"
-  )) |>
+  mutate(series = recode(series, cum_strat = "Strategy", cum_spy = "SPY")) |>
   ggplot(aes(x = return_date, y = cum_ret, color = series)) +
   geom_line(linewidth = 0.85) +
   geom_hline(yintercept = 0, linetype = "dashed") +
   facet_wrap(~ period, scales = "free") +
   scale_y_continuous(labels = percent_format(accuracy = 1)) +
   scale_color_manual(values = c(Strategy = "#1565C0", SPY = "#E65100")) +
-  labs(
-    title = "Cumulative Returns by Period (Rebased to Zero at Period Start)",
-    x = NULL, y = "Cumulative Return", color = NULL
-  ) +
+  labs(title = "Cumulative Returns by Period (Rebased to Zero)",
+       x = NULL, y = "Cumulative Return", color = NULL) +
   theme_minimal(base_size = 11) +
   theme(legend.position = "bottom")
 ```
@@ -1455,7 +1545,7 @@ backtest_df |>
 
 # 13. Parameter Sensitivity
 
-Robust strategies show stable performance across a range of parameter values. Cliff-like optima suggest overfitting to the training sample. The following tests vary the signal threshold and cluster count independently.
+Robust strategies show stable performance across parameter ranges. Cliff-like optima suggest overfitting. Following the class notes: we visualize results as a grid and use Z-score normalization across metrics for comparability.
 
 ## 13.1 Signal Threshold Sensitivity
 
@@ -1467,10 +1557,7 @@ sensitivity_tau <- purrr::map_dfr(thresholds, function(tau) {
     filter(date %in% train_month_ends, !is.na(kf_z)) |>
     select(date, symbol, kf_z) |>
     mutate(signal = case_when(
-      kf_z < -tau ~ "LONG",
-      kf_z >  tau ~ "SHORT",
-      TRUE        ~ "NEUTRAL"
-    ))
+      kf_z < -tau ~ "LONG", kf_z > tau ~ "SHORT", TRUE ~ "NEUTRAL"))
 
   pos <- sigs |>
     group_by(date) |>
@@ -1479,28 +1566,45 @@ sensitivity_tau <- purrr::map_dfr(thresholds, function(tau) {
 
   strat_ret <- pos |>
     rename(signal_date = date) |>
-    left_join(
-      next_month_map |> filter(signal_date %in% train_month_ends),
-      by = "signal_date"
-    ) |>
+    left_join(next_month_map |> filter(signal_date %in% train_month_ends),
+              by = "signal_date") |>
     filter(!is.na(return_date)) |>
-    left_join(
-      monthly_ret_tbl |> select(symbol, return_date = date, monthly_ret),
-      by = c("symbol", "return_date")
-    ) |>
+    left_join(monthly_ret_tbl |> select(symbol, return_date = date, monthly_ret),
+              by = c("symbol", "return_date")) |>
     filter(!is.na(monthly_ret)) |>
     group_by(return_date) |>
     summarise(strategy_ret = sum(weight * monthly_ret, na.rm = TRUE), .groups = "drop")
 
-  if (nrow(strat_ret) < 12L) {
-    return(tibble(tau = tau, sharpe = NA_real_, ann_ret = NA_real_, max_dd = NA_real_))
-  }
+  if (nrow(strat_ret) < 12L) return(tibble(tau = tau, Sharpe = NA, CumReturn = NA, DD.Max = NA))
 
-  m <- calc_metrics(strat_ret$strategy_ret)
-  tibble(tau = tau, sharpe = m$sharpe, ann_ret = m$ann_ret, max_dd = m$max_dd)
+  m <- trade_stats(strat_ret$strategy_ret)
+  tibble(tau = tau, Sharpe = m$Sharpe, CumReturn = m$CumReturn, DD.Max = m$DD.Max)
 })
 
-# Visualise
+# Z-score normalization across metrics (class notes style)
+sensitivity_Z <- sensitivity_tau |>
+  pivot_longer(-tau, names_to = "metric", values_to = "value") |>
+  group_by(metric) |>
+  mutate(valueZ = (value - mean(value, na.rm = TRUE)) / sd(value, na.rm = TRUE)) |>
+  ungroup()
+
+# Heatmap of Z-score normalized metrics (class notes style)
+sensitivity_Z |>
+  ggplot(aes(x = tau, y = metric, fill = valueZ)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0,
+                       name = "Z-score") +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  labs(
+    title    = "Sensitivity Grid — Signal Threshold (τ) — Training Period",
+    subtitle = "Z-score normalized for comparability | Red dashed = chosen threshold",
+    x = "Signal Threshold (τ)", y = "Metric"
+  ) +
+  geom_vline(xintercept = SIGNAL_THRESHOLD, linetype = "dashed", color = "#E53935",
+             linewidth = 0.8) +
+  theme_minimal(base_size = 11)
+
+# Line chart for clarity
 sensitivity_tau |>
   pivot_longer(-tau, names_to = "metric", values_to = "value") |>
   ggplot(aes(x = tau, y = value)) +
@@ -1509,33 +1613,33 @@ sensitivity_tau |>
   geom_vline(xintercept = SIGNAL_THRESHOLD, linetype = "dashed", color = "#E53935") +
   facet_wrap(~ metric, scales = "free_y", ncol = 3,
              labeller = labeller(metric = c(
-               ann_ret = "Annualised Return",
-               max_dd  = "Max Drawdown",
-               sharpe  = "Sharpe Ratio"
-             ))) +
-  labs(
-    title    = "Sensitivity: Signal Threshold (τ) — Training Period",
-    subtitle = "Red dashed = chosen parameter. Stable region = robust choice.",
-    x = "Signal Threshold (τ)", y = "Value"
-  ) +
+               CumReturn = "Cumulative Return",
+               DD.Max    = "Max Drawdown",
+               Sharpe    = "Sharpe Ratio"))) +
+  labs(title = "Parameter Sensitivity: Signal Threshold (τ) — Training Period",
+       subtitle = "Prefer stable region, not cliff-like optima",
+       x = "Signal Threshold (τ)", y = "Value") +
   theme_minimal(base_size = 11)
 ```
 
-## 13.2 Cluster Count Sensitivity Note
+## 13.2 Risk Appetite Filter
 
-A full cluster-count sensitivity analysis would require re-running the clustering loop at each value of `k` (2 through 5). Given the computational cost and the scope of this document, the analysis below reports summary statistics for the chosen `k = 3` and notes the logic for this choice.
+Following the class notes — filter by explicit risk appetite rules, then rank:
 
-```{r sensitivity-clusters}
-cat("Cluster count sensitivity summary:\n")
-cat("  Chosen N_CLUSTERS:", N_CLUSTERS, "\n")
-cat("  Sector ETFs in universe:", length(SECTOR_TICKERS), "\n")
-cat("  Average members per cluster (simple estimate):",
-    round(length(SECTOR_TICKERS) / N_CLUSTERS, 1), "\n")
-cat("\n  Rationale for k = 3:\n")
-cat("  - k = 2: produces very broad clusters; limited peer comparison specificity.\n")
-cat("  - k = 3: balances cluster granularity vs minimum 3-4 members per cluster.\n")
-cat("  - k = 4: risks singleton or duo clusters when XLC/XLRE are absent (pre-2018).\n")
-cat("  - Full sensitivity test recommended before final submission.\n")
+```{r risk-appetite}
+# Define risk appetite: Sharpe > 0 and Max Drawdown > -40%
+sensitivity_tau |>
+  filter(!is.na(Sharpe), Sharpe > 0, DD.Max > -0.40) |>
+  arrange(desc(Sharpe)) |>
+  gt() |>
+  tab_header(
+    title    = "Parameter Combinations Meeting Risk Appetite",
+    subtitle = "Filter: Sharpe > 0 and DD.Max > -40% | Ranked by Sharpe"
+  ) |>
+  fmt_percent(columns = c(CumReturn, DD.Max), decimals = 1) |>
+  fmt_number(columns = Sharpe, decimals = 3) |>
+  cols_label(tau = "Threshold (τ)", Sharpe = "Sharpe",
+             CumReturn = "Cum Return", DD.Max = "Max DD")
 ```
 
 ---
@@ -1547,36 +1651,46 @@ cat("  - Full sensitivity test recommended before final submission.\n")
 | Assumption | Detail |
 |---|---|
 | **Execution timing** | Signal at month-end close; return from that close to the next month-end close. No intraday timing assumed. |
-| **Short selling** | ETFs assumed shortable at zero cost. Borrow fees, dividends owed on shorts, and margin mechanics are excluded (permitted by assignment scope). |
-| **Slippage / commissions** | Not modeled. Sector SPDR ETFs are highly liquid; real-world impact would be small but non-zero. |
-| **Kalman initialization** | Filter initialized at first non-NA residual for each ETF. Early estimates are less reliable; this affects approximately the first 60–90 days per series. |
-| **Leave-one-out breakdown** | Singleton clusters (cluster_n = 1) produce undefined peer means and are excluded from signal generation for those dates. |
-| **XLC / XLRE availability** | These tickers are absent from clustering and signal generation before their respective data start dates. No synthetic backfill is applied. |
+| **Short selling** | ETFs assumed shortable at zero cost. Borrow fees, dividends owed on shorts, and margin mechanics excluded (permitted by assignment scope per class Q&A). |
+| **Transaction costs** | Not modeled. Sector SPDR ETFs are highly liquid — bid/offer and commissions are small but non-zero. |
+| **Kalman initialization** | Filter initialized at first non-NA residual. Early estimates less reliable for first ~60 days per series. |
+| **Solo clusters** | Singleton clusters (cluster_n = 1) produce undefined peer means and are excluded from signal generation. |
+| **XLC / XLRE** | Absent from clustering and signal generation before their data start dates. No backfill applied. |
+
+## Common Traps Checked (Class Notes Section 8.6.3)
+
+| Trap | Status |
+|---|---|
+| **Look-ahead bias** | Guarded: strict `date >= TRAIN_START` filter; Kalman runs sequentially; clustering uses only past features |
+| **Survivorship bias** | Not an issue: all current ETFs existed throughout; XLC/XLRE excluded when absent |
+| **Storytelling bias** | Mental model written before code; strategy choice documented in ContextV1.md |
+| **Data mining / snooping** | One signal definition; parameter sensitivity shows stable region not cliff-like optimum |
+| **Transaction costs** | Noted as exclusion; turnover computed and reported |
+| **Outliers** | Omega ratio and % win metrics guard against outlier-driven results |
 
 ## Strategy Limitations
 
-**Mean-reversion assumption**: The strategy assumes within-cluster deviations are temporary. During structural breaks (e.g., 2008 financial crisis for XLF; 2020 for XLE), deviations may persist or widen rather than revert, producing sustained drawdowns.
+**Mean-reversion assumption**: During structural breaks (2008 XLF; 2020 XLE), deviations may persist rather than revert, producing sustained drawdowns. The Kalman filter's slow state adaptation helps but cannot distinguish noise from structural change.
 
-**Cluster instability**: Cluster labels are re-estimated monthly. A sector undergoing a genuine regime change may be misassigned for several rebalance periods before the feature vector adjusts.
+**Cluster instability**: Monthly re-estimation helps but a sector undergoing genuine regime change may be misassigned for several rebalance periods.
 
-**Small universe**: With 10–11 ETFs and k = 3, clusters average 3–4 members. The leave-one-out benchmark is sensitive to any single member's idiosyncratic behavior.
+**Small universe**: 10–11 ETFs with k=3 gives ~3–4 members per cluster. Leave-one-out benchmarks are sensitive to any single member's idiosyncratic behavior.
 
-**Kalman parameter sensitivity**: The Q/R ratio was set by default reasoning. Misspecification of the noise ratio produces either over-smoothing (slow signal, misses opportunities) or under-smoothing (noisy signal, false positives).
-
-**Out-of-sample horizon**: The testing period (January 2025 – March 2026) is only 15 months. Performance assessments over this window should be treated as preliminary given the short evaluation horizon.
+**Out-of-sample horizon**: Testing period (Jan 2025 – Mar 2026) is only 15 months — insufficient for conclusive out-of-sample judgment.
 
 ## Mental Model Alignment Verification
 
-The table below confirms that every code component maps to the governing mental model.
-
 | Code Component | Mental Model Element | Aligned |
 |---|---|---|
-| `cluster_at_date()` → `hclust()` | Clustering is the primary signal engine | ✓ |
+| `cluster_at_date()` with `hclust()` | Clustering is the primary signal engine | ✓ |
 | `standardize_features()` via `recipes` | Tidymodels preprocessing workflow | ✓ |
+| Elbow method + silhouette validation | Validate k, don't guess | ✓ |
+| K-Means + Hierarchical comparison | Agreement = robust structure | ✓ |
 | Leave-one-out peer mean | Fair value is cluster-relative, not global | ✓ |
 | `kalman_local_level()` | Kalman refines cluster-relative signal | ✓ |
-| z-score threshold `SIGNAL_THRESHOLD` | Margin of safety — only trade large deviations | ✓ |
-| `MAX_LONGS` / `MAX_SHORTS` | Opportunity cost — capital to strongest signals only | ✓ |
-| Month-end only rebalance | Systems thinking — monthly discipline | ✓ |
-| Strict train/test split + leakage check | Inversion — guard against look-ahead and overfitting | ✓ |
-| Parameter sensitivity section | Risk-reward — stability matters as much as return | ✓ |
+| z-score threshold `SIGNAL_THRESHOLD` | Margin of safety | ✓ |
+| `MAX_LONGS` / `MAX_SHORTS` | Opportunity cost — strongest signals only | ✓ |
+| Month-end only rebalance | Monthly discipline | ✓ |
+| Strict train/test + leakage check | Inversion — guard against look-ahead | ✓ |
+| `table.Drawdowns()`, `chart.Correlation()` | Full tradeStats risk assessment | ✓ |
+| Z-score heatmap + risk appetite filter | Risk-reward framework | ✓ |
