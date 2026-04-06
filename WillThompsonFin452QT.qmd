@@ -1147,6 +1147,45 @@ pos_summary |>
   theme_minimal(base_size = 11)
 ```
 
+## 10.1 Position Chart — ETF Weights Over Time
+
+```{r position-chart}
+# Build a full grid: every sector ETF × every rebalance date (post TRAIN_START)
+all_symbols_pos <- expand_grid(
+  symbol = SECTOR_TICKERS,
+  date   = all_month_ends[all_month_ends >= TRAIN_START]
+)
+
+positions_full_grid <- all_symbols_pos |>
+  left_join(
+    positions_all |> select(date, symbol, weight, signal),
+    by = c("date", "symbol")
+  ) |>
+  mutate(weight = replace_na(weight, 0))
+
+# Heatmap: green = long, red = short, white = flat
+ggplot(positions_full_grid, aes(x = date, y = symbol, fill = weight)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  scale_fill_gradient2(
+    low      = "#E53935",
+    mid      = "white",
+    high     = "#4CAF50",
+    midpoint = 0,
+    name     = "Weight",
+    labels   = percent_format(accuracy = 1)
+  ) +
+  geom_vline(xintercept = as.numeric(TEST_START),
+             linetype = "dotted", linewidth = 0.7, color = "black") +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(
+    title    = "ETF Position Weights Over Time",
+    subtitle = "Green = long | Red = short | White = flat | Dotted line = start of testing period",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
 ---
 
 # 11. Backtest
@@ -1232,6 +1271,69 @@ xts::addSeries(backtest_xts$cum_spy,
 xts::addSeries(backtest_xts$strategy_ret,
      main = "Monthly Return", on = NA,
      type = "h", col = "#1565C0", lty = 1, lwd = 1, pch = 0)
+```
+
+## 11.4 Trade Markers on Price Chart
+
+Following the class notes style — overlay entry/exit markers directly on the price chart to visually confirm signal timing and frequency.
+
+```{r trade-markers}
+# SPY monthly price as the backdrop
+spy_prices_monthly <- monthly_prices |>
+  filter(symbol == "SPY", date >= TRAIN_START) |>
+  select(date, adjusted)
+
+# Summarise position direction at each rebalance
+position_markers <- positions_all |>
+  filter(date >= TRAIN_START) |>
+  group_by(date) |>
+  summarise(
+    n_long  = sum(signal == "LONG"),
+    n_short = sum(signal == "SHORT"),
+    .groups = "drop"
+  ) |>
+  mutate(direction = case_when(
+    n_long > 0 & n_short > 0  ~ "Long & Short",
+    n_long > 0                 ~ "Long Only",
+    n_short > 0                ~ "Short Only",
+    TRUE                       ~ "Flat"
+  )) |>
+  filter(direction != "Flat") |>
+  left_join(spy_prices_monthly, by = "date")
+
+ggplot(spy_prices_monthly, aes(x = date, y = adjusted)) +
+  geom_line(color = "grey55", linewidth = 0.5) +
+  # Long entries (upward triangles)
+  geom_point(
+    data  = position_markers |> filter(grepl("Long", direction)),
+    aes(color = "Long Entry"),
+    shape = 24, size = 2.8, fill = "#4CAF50", stroke = 0.4
+  ) +
+  # Short entries (downward triangles)
+  geom_point(
+    data  = position_markers |> filter(grepl("Short", direction)),
+    aes(color = "Short Entry"),
+    shape = 25, size = 2.8, fill = "#E53935", stroke = 0.4
+  ) +
+  geom_vline(xintercept = TEST_START, linetype = "dotted",
+             color = "black", linewidth = 0.7) +
+  annotate("text", x = TEST_START + 30, y = min(spy_prices_monthly$adjusted, na.rm = TRUE),
+           label = "← Train | Test →", size = 3, hjust = 0, color = "grey40") +
+  scale_color_manual(
+    values = c("Long Entry" = "#4CAF50", "Short Entry" = "#E53935"),
+    guide  = guide_legend(
+      override.aes = list(shape = c(24L, 25L), fill = c("#4CAF50", "#E53935"))
+    )
+  ) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title    = "Trade Markers on SPY Price Chart",
+    subtitle = "▲ = rebalance with ≥1 long | ▼ = rebalance with ≥1 short | Monthly frequency",
+    x = NULL, y = "SPY Adjusted Price ($)", color = "Trade Direction"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
 ```
 
 ---
@@ -1355,6 +1457,7 @@ trade_stats <- function(ret_vec, rf = 0) {
     `%.InMrkt` = pct_in_mkt,
     DD.Length  = dd_length,
     DD.Max     = dd_max,
+    N.Trades   = sum(r != 0),   # Months with an active position
     N.Months   = n
   )
 }
@@ -1382,7 +1485,7 @@ stats_tbl |>
   fmt_percent(columns = c(CumReturn, Ret.Ann, SD.Ann, `%.Win`, `%.InMrkt`, DD.Max),
               decimals = 1) |>
   fmt_number(columns  = c(Sharpe, Omega), decimals = 2) |>
-  fmt_integer(columns = c(DD.Length, N.Months)) |>
+  fmt_integer(columns = c(DD.Length, N.Trades, N.Months)) |>
   tab_style(
     style     = cell_fill(color = "#E3F2FD"),
     locations = cells_body(rows = grepl("Strategy", Period))
@@ -1398,6 +1501,7 @@ stats_tbl |>
     `%.InMrkt` = "% In Mkt",
     DD.Length  = "DD Length",
     DD.Max     = "DD Max",
+    N.Trades   = "# Trades",
     N.Months   = "Months"
   )
 ```
@@ -1451,9 +1555,109 @@ backtest_df |>
        x = NULL, y = "Sharpe (annualised)", color = NULL) +
   theme_minimal(base_size = 11) +
   theme(legend.position = "bottom")
+
+# Rolling 12-month cumulative return
+backtest_df |>
+  mutate(
+    roll_ret_strat = slider::slide_dbl(strategy_ret,
+                       ~ prod(1 + .x) - 1, .before = 11L, .complete = TRUE),
+    roll_ret_spy   = slider::slide_dbl(spy_ret,
+                       ~ prod(1 + .x) - 1, .before = 11L, .complete = TRUE)
+  ) |>
+  filter(!is.na(roll_ret_strat)) |>
+  select(return_date, roll_ret_strat, roll_ret_spy) |>
+  pivot_longer(-return_date, names_to = "series", values_to = "ret") |>
+  mutate(series = recode(series,
+    roll_ret_strat = "Strategy", roll_ret_spy = "SPY")) |>
+  ggplot(aes(x = return_date, y = ret, color = series)) +
+  geom_line(linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = TEST_START, linetype = "dotted", color = "black") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = c(Strategy = "#1565C0", SPY = "#E65100")) +
+  labs(
+    title    = "12-Month Rolling Cumulative Return",
+    subtitle = "Dotted = start of testing period",
+    x = NULL, y = "12-Month Return", color = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
 ```
 
-## 12.7 Trade Analysis
+## 12.7 Sharpe vs Omega: Return Distribution Overlay
+
+Following the class notes: Sharpe assumes returns are normally distributed and penalises upside and downside equally. Omega measures the actual ratio of gains to losses — it captures skew and fat tails that Sharpe misses. This chart visualises **why both matter**.
+
+```{r sharpe-omega-overlay}
+# Training period returns for the visual
+ret_train_vec <- backtest_df |>
+  filter(period == "Training") |>
+  pull(strategy_ret)
+
+ret_df_viz <- tibble(ret = ret_train_vec) |> drop_na()
+
+mu_train    <- mean(ret_df_viz$ret)
+sigma_train <- sd(ret_df_viz$ret)
+MAR         <- 0
+
+# Omega numerator / denominator from actual returns
+omega_num <- sum(ret_df_viz$ret[ret_df_viz$ret > MAR] - MAR)
+omega_den <- sum(MAR - ret_df_viz$ret[ret_df_viz$ret <= MAR])
+omega_val <- if (omega_den > 0) omega_num / omega_den else Inf
+
+sharpe_ann <- (mu_train * 12) / (sigma_train * sqrt(12))
+
+ggplot(ret_df_viz, aes(x = ret)) +
+  # Gains (Omega numerator shaded green)
+  geom_histogram(
+    data    = filter(ret_df_viz, ret > MAR),
+    aes(y = after_stat(density), fill = "Gains — Omega numerator"),
+    bins = 25, alpha = 0.75, color = "white", linewidth = 0.1
+  ) +
+  # Losses (Omega denominator shaded red)
+  geom_histogram(
+    data    = filter(ret_df_viz, ret <= MAR),
+    aes(y = after_stat(density), fill = "Losses — Omega denominator"),
+    bins = 25, alpha = 0.75, color = "white", linewidth = 0.1
+  ) +
+  # Normal curve (Sharpe's assumed distribution)
+  stat_function(
+    fun  = dnorm,
+    args = list(mean = mu_train, sd = sigma_train),
+    color = "#1565C0", linewidth = 1.3, linetype = "solid"
+  ) +
+  # Mean line (Sharpe numerator)
+  geom_vline(xintercept = mu_train, color = "#1565C0",
+             linetype = "dashed", linewidth = 1) +
+  # MAR = 0
+  geom_vline(xintercept = MAR, color = "black", linewidth = 0.6) +
+  # ±1 SD shading bands
+  geom_vline(xintercept = c(mu_train - sigma_train, mu_train + sigma_train),
+             color = "#1565C0", linetype = "dotted", linewidth = 0.7) +
+  scale_fill_manual(values = c(
+    "Gains — Omega numerator"   = "#4CAF50",
+    "Losses — Omega denominator" = "#E53935"
+  )) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  annotate("text", x = mu_train + 0.0015, y = Inf,
+           label = paste0("μ  (Sharpe numerator)"),
+           vjust = 2.2, hjust = 0, color = "#1565C0", size = 3.2) +
+  labs(
+    title    = "Sharpe vs Omega: Return Distribution — Training Period",
+    subtitle = paste0(
+      "Blue curve = Normal(μ, σ) assumed by Sharpe  |  ",
+      "Omega = Green area ÷ Red area\n",
+      "Sharpe (ann.) = ", round(sharpe_ann, 2),
+      "  |  Omega = ", round(omega_val, 2),
+      "  |  Dashed = mean  |  Dotted = ±1 SD"
+    ),
+    x = "Monthly Return", y = "Density", fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+## 12.8 Trade Analysis
 
 ```{r trade-analysis}
 # Turnover
@@ -1518,7 +1722,7 @@ backtest_df |>
   theme_minimal(base_size = 11)
 ```
 
-## 12.8 Training vs Testing Comparison
+## 12.9 Training vs Testing Comparison
 
 ```{r train-test-comparison}
 backtest_df |>
@@ -1622,9 +1826,52 @@ sensitivity_tau |>
   theme_minimal(base_size = 11)
 ```
 
-## 13.2 Risk Appetite Filter
+## 13.2 Table of Top Parameter Combinations
 
-Following the class notes — filter by explicit risk appetite rules, then rank:
+Following the class notes — rank all parameter combinations and highlight the top performers. Prefer stable regions over cliff-like optima (neighboring values should also score well).
+
+```{r top-parameters}
+# Full ranked table of all parameter combinations tested
+sensitivity_tau |>
+  arrange(desc(Sharpe)) |>
+  mutate(
+    rank    = row_number(),
+    optimal = if_else(rank == 1L, "★ Best", ""),
+    chosen  = if_else(tau == SIGNAL_THRESHOLD, "← Chosen", "")
+  ) |>
+  gt() |>
+  tab_header(
+    title    = "All Parameter Combinations — Ranked by Sharpe (Training Period)",
+    subtitle = paste0(
+      "Prefer stable region over cliff-like optima | Chosen τ = ",
+      SIGNAL_THRESHOLD, " | ★ = best Sharpe"
+    )
+  ) |>
+  fmt_percent(columns = c(CumReturn, DD.Max), decimals = 1) |>
+  fmt_number(columns = Sharpe, decimals = 3) |>
+  fmt_integer(columns = rank) |>
+  tab_style(
+    style     = cell_fill(color = "#FFF9C4"),
+    locations = cells_body(rows = chosen == "← Chosen")
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = optimal == "★ Best")
+  ) |>
+  cols_label(
+    rank      = "Rank",
+    tau       = "Threshold (τ)",
+    Sharpe    = "Sharpe",
+    CumReturn = "Cum Return",
+    DD.Max    = "Max DD",
+    optimal   = "",
+    chosen    = ""
+  )
+```
+
+## 13.3 Risk Appetite Filter
+
+Following the class notes — filter by explicit risk appetite rules, then rank. Useful when multiple metrics conflict: Sharpe vs drawdown tradeoff.
 
 ```{r risk-appetite}
 # Define risk appetite: Sharpe > 0 and Max Drawdown > -40%
@@ -1642,9 +1889,254 @@ sensitivity_tau |>
              CumReturn = "Cum Return", DD.Max = "Max DD")
 ```
 
+## 13.4 Two-Parameter Optimization Grid
+
+Following the class notes exactly — sweep **two parameters simultaneously** to produce both the 2D `geom_raster` heatmap and the interactive `plotly` 3D surface. A robust strategy shows a **smooth hill**, not a sharp spike.
+
+- **par1value** = Signal threshold (τ): how large the Kalman z-score must be to trigger a trade
+- **par2value** = Max positions per side: how many ETFs we hold long and short simultaneously
+
+```{r two-param-grid}
+#| cache: true
+
+# ── Define 2-parameter grid ────────────────────────────────────────────────────
+par1_grid <- seq(0.50, 2.00, by = 0.25)   # Signal threshold τ (7 values)
+par2_grid <- 1:5                           # Max positions per side (5 values)
+
+grid_params <- expand_grid(
+  par1value = par1_grid,   # tau
+  par2value = par2_grid    # max_pos
+)
+
+cat("Running 2-parameter grid:", nrow(grid_params), "combinations...\n")
+
+# ── Evaluation function for a single (tau, max_pos) pair ──────────────────────
+eval_params <- function(tau, max_pos) {
+  sigs <- kalman_results |>
+    filter(date %in% train_month_ends, !is.na(kf_z)) |>
+    select(date, symbol, kf_z) |>
+    mutate(signal = case_when(
+      kf_z < -tau ~ "LONG",
+      kf_z >  tau ~ "SHORT",
+      TRUE        ~ "NEUTRAL"
+    ))
+
+  pos <- sigs |>
+    group_by(date) |>
+    group_modify(~ build_positions(.x,
+                                   max_longs  = max_pos,
+                                   max_shorts = max_pos)) |>
+    ungroup()
+
+  strat_ret <- pos |>
+    rename(signal_date = date) |>
+    left_join(next_month_map |> filter(signal_date %in% train_month_ends),
+              by = "signal_date") |>
+    filter(!is.na(return_date)) |>
+    left_join(monthly_ret_tbl |> select(symbol, return_date = date, monthly_ret),
+              by = c("symbol", "return_date")) |>
+    filter(!is.na(monthly_ret)) |>
+    group_by(return_date) |>
+    summarise(strategy_ret = sum(weight * monthly_ret, na.rm = TRUE), .groups = "drop")
+
+  if (nrow(strat_ret) < 12L) {
+    return(tibble(par1value = tau, par2value = max_pos,
+                  CumReturn = NA_real_, Sharpe = NA_real_, DD.Max = NA_real_))
+  }
+
+  m <- trade_stats(strat_ret$strategy_ret)
+  tibble(par1value = tau, par2value = max_pos,
+         CumReturn = m$CumReturn, Sharpe = m$Sharpe, DD.Max = m$DD.Max)
+}
+
+# ── Run all combinations ───────────────────────────────────────────────────────
+out <- purrr::map2_dfr(
+  grid_params$par1value,
+  grid_params$par2value,
+  eval_params
+)
+
+cat("Grid complete.\n")
+cat("Best Sharpe    :", round(max(out$Sharpe,    na.rm = TRUE), 3),
+    "at τ =", out$par1value[which.max(out$Sharpe)],
+    "/ max_pos =", out$par2value[which.max(out$Sharpe)], "\n")
+cat("Best CumReturn :", round(max(out$CumReturn, na.rm = TRUE), 3),
+    "at τ =", out$par1value[which.max(out$CumReturn)],
+    "/ max_pos =", out$par2value[which.max(out$CumReturn)], "\n")
+```
+
+### Optimization Results Grid — 2D Raster (class notes style)
+
+```{r opt-grid-2d}
+# Matching the class notes code exactly:
+# geom_raster with interpolate = TRUE for smooth gradient
+out |>
+  dplyr::select(par1value, par2value, CumReturn) |>
+  ggplot(aes(x = par1value, y = par2value)) +
+  geom_raster(aes(fill = CumReturn), interpolate = TRUE) +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue",
+                       midpoint = median(out$CumReturn, na.rm = TRUE)) +
+  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = MAX_LONGS),
+             shape = 3, size = 5, color = "black", stroke = 1.5) +
+  scale_x_continuous(breaks = par1_grid) +
+  scale_y_continuous(breaks = par2_grid) +
+  theme(
+    panel.grid.major.x = element_line(colour = "grey"),
+    panel.grid.minor.x = element_line(colour = "grey"),
+    panel.grid.major.y = element_line(colour = "grey"),
+    panel.grid.minor.y = element_line(colour = "grey"),
+    panel.background   = element_rect(fill = "white")
+  ) +
+  labs(
+    title    = "Optimization Results Grid — CumReturn",
+    subtitle = paste0(
+      "par1 = Signal Threshold (τ)  |  par2 = Max Positions per Side\n",
+      "Cross = chosen parameters (τ = ", SIGNAL_THRESHOLD,
+      ", max_pos = ", MAX_LONGS, ")"
+    ),
+    x    = "par1value — Signal Threshold (τ)",
+    y    = "par2value — Max Positions per Side",
+    fill = "CumReturn"
+  )
+
+# Also show Sharpe grid for robustness comparison
+out |>
+  dplyr::select(par1value, par2value, Sharpe) |>
+  ggplot(aes(x = par1value, y = par2value)) +
+  geom_raster(aes(fill = Sharpe), interpolate = TRUE) +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue",
+                       midpoint = median(out$Sharpe, na.rm = TRUE)) +
+  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = MAX_LONGS),
+             shape = 3, size = 5, color = "black", stroke = 1.5) +
+  scale_x_continuous(breaks = par1_grid) +
+  scale_y_continuous(breaks = par2_grid) +
+  theme(
+    panel.grid.major.x = element_line(colour = "grey"),
+    panel.grid.minor.x = element_line(colour = "grey"),
+    panel.grid.major.y = element_line(colour = "grey"),
+    panel.grid.minor.y = element_line(colour = "grey"),
+    panel.background   = element_rect(fill = "white")
+  ) +
+  labs(
+    title    = "Optimization Results Grid — Sharpe Ratio",
+    subtitle = "Smooth region = robust | Cliff-like = overfit",
+    x = "par1value — Signal Threshold (τ)",
+    y = "par2value — Max Positions per Side",
+    fill = "Sharpe"
+  )
+```
+
+### 3D Surface — CumReturn (class notes plotly style)
+
+```{r opt-grid-3d}
+# Matching the class notes code exactly:
+# pivot_wider → matrix → plot_ly %>% add_surface()
+par2_vals <- unique(out$par2value)
+par1_vals <- unique(out$par1value)
+
+CumReturn_mat <- out |>
+  dplyr::select(par1value, par2value, CumReturn) |>
+  tidyr::pivot_wider(values_from = CumReturn, names_from = par2value) |>
+  dplyr::select(-1) |>
+  as.matrix()
+
+plotly::plot_ly(
+  x = ~ par2_vals,
+  y = ~ par1_vals,
+  z = ~ CumReturn_mat
+) |>
+  plotly::add_surface(
+    colorscale = list(c(0, 1), c("purple", "yellow")),
+    showscale  = TRUE
+  ) |>
+  plotly::layout(
+    title = "3D Optimization Surface — CumReturn",
+    scene = list(
+      xaxis = list(title = "par2: Max Positions"),
+      yaxis = list(title = "par1: Signal Threshold (τ)"),
+      zaxis = list(title = "CumReturn")
+    )
+  )
+```
+
 ---
 
 # 14. Limitations and Assumptions
+
+## Transaction Costs and Turnover
+
+Transaction costs are not modeled in the backtest returns above, but are explicitly quantified here as required by the class notes.
+
+```{r transaction-costs}
+# ── Turnover summary ────────────────────────────────────────────────────────────
+turnover_summary <- turnover_df |>
+  filter(date >= TRAIN_START) |>
+  summarise(
+    avg_monthly_turnover    = mean(turnover, na.rm = TRUE),
+    median_monthly_turnover = median(turnover, na.rm = TRUE),
+    max_monthly_turnover    = max(turnover, na.rm = TRUE),
+    annual_turnover_est     = mean(turnover, na.rm = TRUE) * 12
+  )
+
+cat("=== Turnover Analysis ===\n")
+cat("Avg monthly one-way turnover  :", percent(turnover_summary$avg_monthly_turnover, 0.1), "\n")
+cat("Median monthly one-way turnover:", percent(turnover_summary$median_monthly_turnover, 0.1), "\n")
+cat("Est. annual one-way turnover  :", percent(turnover_summary$annual_turnover_est, 0.1), "\n")
+
+# ── Estimate performance drag at different cost assumptions ────────────────────
+cost_bps <- c(5, 10, 20, 30)   # Round-trip transaction cost in basis points
+
+cost_impact <- tibble(
+  cost_bps     = cost_bps,
+  annual_drag  = turnover_summary$annual_turnover_est * (cost_bps / 10000),
+  cost_pct     = cost_bps / 100
+) |>
+  mutate(
+    description = paste0(cost_bps, " bps round-trip"),
+    annual_drag_pct = annual_drag
+  )
+
+cost_impact |>
+  select(description, cost_bps, annual_drag_pct) |>
+  gt() |>
+  tab_header(
+    title    = "Estimated Annual Performance Drag from Transaction Costs",
+    subtitle = paste0(
+      "Based on estimated annual one-way turnover of ",
+      percent(turnover_summary$annual_turnover_est, 0.1),
+      " | Sector SPDR ETFs: typical bid/ask ~1–3 bps"
+    )
+  ) |>
+  fmt_percent(columns = annual_drag_pct, decimals = 2) |>
+  cols_label(
+    description    = "Assumed Cost",
+    cost_bps       = "Round-Trip (bps)",
+    annual_drag_pct = "Est. Annual Drag"
+  ) |>
+  tab_footnote(
+    footnote  = "Drag = annual turnover × round-trip cost. Sector SPDRs are highly liquid; 5–10 bps is realistic.",
+    locations = cells_column_labels(columns = annual_drag_pct)
+  )
+
+# ── Turnover over time chart ────────────────────────────────────────────────────
+turnover_df |>
+  filter(date >= TRAIN_START) |>
+  ggplot(aes(x = date, y = turnover)) +
+  geom_col(fill = "#1565C0", alpha = 0.7, width = 25) +
+  geom_hline(yintercept = mean(turnover_df$turnover, na.rm = TRUE),
+             linetype = "dashed", color = "#E53935") +
+  geom_vline(xintercept = TEST_START, linetype = "dotted", color = "black") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  annotate("text", x = TEST_START + 30, y = 0,
+           label = "← Train | Test →", size = 3, hjust = 0, color = "grey40") +
+  labs(
+    title    = "Monthly Portfolio Turnover",
+    subtitle = "Red dashed = average | Dotted = start of testing period",
+    x = NULL, y = "One-Way Turnover"
+  ) +
+  theme_minimal(base_size = 11)
+```
 
 ## Implementation Assumptions
 
