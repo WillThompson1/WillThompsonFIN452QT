@@ -1889,6 +1889,176 @@ sensitivity_tau |>
              CumReturn = "Cum Return", DD.Max = "Max DD")
 ```
 
+## 13.4 Two-Parameter Optimization Grid
+
+Following the class notes exactly — sweep **two parameters simultaneously** to produce both the 2D `geom_raster` heatmap and the interactive `plotly` 3D surface. A robust strategy shows a **smooth hill**, not a sharp spike.
+
+- **par1value** = Signal threshold (τ): how large the Kalman z-score must be to trigger a trade
+- **par2value** = Max positions per side: how many ETFs we hold long and short simultaneously
+
+```{r two-param-grid}
+#| cache: true
+
+# ── Define 2-parameter grid ────────────────────────────────────────────────────
+par1_grid <- seq(0.50, 2.00, by = 0.25)   # Signal threshold τ (7 values)
+par2_grid <- 1:5                           # Max positions per side (5 values)
+
+grid_params <- expand_grid(
+  par1value = par1_grid,   # tau
+  par2value = par2_grid    # max_pos
+)
+
+cat("Running 2-parameter grid:", nrow(grid_params), "combinations...\n")
+
+# ── Evaluation function for a single (tau, max_pos) pair ──────────────────────
+eval_params <- function(tau, max_pos) {
+  sigs <- kalman_results |>
+    filter(date %in% train_month_ends, !is.na(kf_z)) |>
+    select(date, symbol, kf_z) |>
+    mutate(signal = case_when(
+      kf_z < -tau ~ "LONG",
+      kf_z >  tau ~ "SHORT",
+      TRUE        ~ "NEUTRAL"
+    ))
+
+  pos <- sigs |>
+    group_by(date) |>
+    group_modify(~ build_positions(.x,
+                                   max_longs  = max_pos,
+                                   max_shorts = max_pos)) |>
+    ungroup()
+
+  strat_ret <- pos |>
+    rename(signal_date = date) |>
+    left_join(next_month_map |> filter(signal_date %in% train_month_ends),
+              by = "signal_date") |>
+    filter(!is.na(return_date)) |>
+    left_join(monthly_ret_tbl |> select(symbol, return_date = date, monthly_ret),
+              by = c("symbol", "return_date")) |>
+    filter(!is.na(monthly_ret)) |>
+    group_by(return_date) |>
+    summarise(strategy_ret = sum(weight * monthly_ret, na.rm = TRUE), .groups = "drop")
+
+  if (nrow(strat_ret) < 12L) {
+    return(tibble(par1value = tau, par2value = max_pos,
+                  CumReturn = NA_real_, Sharpe = NA_real_, DD.Max = NA_real_))
+  }
+
+  m <- trade_stats(strat_ret$strategy_ret)
+  tibble(par1value = tau, par2value = max_pos,
+         CumReturn = m$CumReturn, Sharpe = m$Sharpe, DD.Max = m$DD.Max)
+}
+
+# ── Run all combinations ───────────────────────────────────────────────────────
+out <- purrr::map2_dfr(
+  grid_params$par1value,
+  grid_params$par2value,
+  eval_params
+)
+
+cat("Grid complete.\n")
+cat("Best Sharpe    :", round(max(out$Sharpe,    na.rm = TRUE), 3),
+    "at τ =", out$par1value[which.max(out$Sharpe)],
+    "/ max_pos =", out$par2value[which.max(out$Sharpe)], "\n")
+cat("Best CumReturn :", round(max(out$CumReturn, na.rm = TRUE), 3),
+    "at τ =", out$par1value[which.max(out$CumReturn)],
+    "/ max_pos =", out$par2value[which.max(out$CumReturn)], "\n")
+```
+
+### Optimization Results Grid — 2D Raster (class notes style)
+
+```{r opt-grid-2d}
+# Matching the class notes code exactly:
+# geom_raster with interpolate = TRUE for smooth gradient
+out |>
+  dplyr::select(par1value, par2value, CumReturn) |>
+  ggplot(aes(x = par1value, y = par2value)) +
+  geom_raster(aes(fill = CumReturn), interpolate = TRUE) +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue",
+                       midpoint = median(out$CumReturn, na.rm = TRUE)) +
+  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = MAX_LONGS),
+             shape = 3, size = 5, color = "black", stroke = 1.5) +
+  scale_x_continuous(breaks = par1_grid) +
+  scale_y_continuous(breaks = par2_grid) +
+  theme(
+    panel.grid.major.x = element_line(colour = "grey"),
+    panel.grid.minor.x = element_line(colour = "grey"),
+    panel.grid.major.y = element_line(colour = "grey"),
+    panel.grid.minor.y = element_line(colour = "grey"),
+    panel.background   = element_rect(fill = "white")
+  ) +
+  labs(
+    title    = "Optimization Results Grid — CumReturn",
+    subtitle = paste0(
+      "par1 = Signal Threshold (τ)  |  par2 = Max Positions per Side\n",
+      "Cross = chosen parameters (τ = ", SIGNAL_THRESHOLD,
+      ", max_pos = ", MAX_LONGS, ")"
+    ),
+    x    = "par1value — Signal Threshold (τ)",
+    y    = "par2value — Max Positions per Side",
+    fill = "CumReturn"
+  )
+
+# Also show Sharpe grid for robustness comparison
+out |>
+  dplyr::select(par1value, par2value, Sharpe) |>
+  ggplot(aes(x = par1value, y = par2value)) +
+  geom_raster(aes(fill = Sharpe), interpolate = TRUE) +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue",
+                       midpoint = median(out$Sharpe, na.rm = TRUE)) +
+  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = MAX_LONGS),
+             shape = 3, size = 5, color = "black", stroke = 1.5) +
+  scale_x_continuous(breaks = par1_grid) +
+  scale_y_continuous(breaks = par2_grid) +
+  theme(
+    panel.grid.major.x = element_line(colour = "grey"),
+    panel.grid.minor.x = element_line(colour = "grey"),
+    panel.grid.major.y = element_line(colour = "grey"),
+    panel.grid.minor.y = element_line(colour = "grey"),
+    panel.background   = element_rect(fill = "white")
+  ) +
+  labs(
+    title    = "Optimization Results Grid — Sharpe Ratio",
+    subtitle = "Smooth region = robust | Cliff-like = overfit",
+    x = "par1value — Signal Threshold (τ)",
+    y = "par2value — Max Positions per Side",
+    fill = "Sharpe"
+  )
+```
+
+### 3D Surface — CumReturn (class notes plotly style)
+
+```{r opt-grid-3d}
+# Matching the class notes code exactly:
+# pivot_wider → matrix → plot_ly %>% add_surface()
+par2_vals <- unique(out$par2value)
+par1_vals <- unique(out$par1value)
+
+CumReturn_mat <- out |>
+  dplyr::select(par1value, par2value, CumReturn) |>
+  tidyr::pivot_wider(values_from = CumReturn, names_from = par2value) |>
+  dplyr::select(-1) |>
+  as.matrix()
+
+plotly::plot_ly(
+  x = ~ par2_vals,
+  y = ~ par1_vals,
+  z = ~ CumReturn_mat
+) |>
+  plotly::add_surface(
+    colorscale = list(c(0, 1), c("purple", "yellow")),
+    showscale  = TRUE
+  ) |>
+  plotly::layout(
+    title = "3D Optimization Surface — CumReturn",
+    scene = list(
+      xaxis = list(title = "par2: Max Positions"),
+      yaxis = list(title = "par1: Signal Threshold (τ)"),
+      zaxis = list(title = "CumReturn")
+    )
+  )
+```
+
 ---
 
 # 14. Limitations and Assumptions
