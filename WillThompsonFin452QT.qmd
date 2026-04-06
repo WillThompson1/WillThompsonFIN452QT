@@ -5,3 +5,17 @@ format: html
 ---
 
 
+```{r}
+
+
+library(tidyverse)
+library(tidyquant)
+library(timetk)
+library(TTR)
+library(PerformanceAnalytics)
+
+
+
+
+```
+
