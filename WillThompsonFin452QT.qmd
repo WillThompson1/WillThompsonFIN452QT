@@ -1787,12 +1787,13 @@ sensitivity_tau |>
 #| cache: true
 
 # ── Define 2-parameter grid ────────────────────────────────────────────────────
-# par1: Signal threshold τ — controls how extreme a z-score must be to trade
-# par2: Residual lookback window (trading days) — changes the cumulative-return
-#        period from which cluster-relative residuals are computed.
-#        Shorter windows → faster signals; longer windows → smoother, lower-freq.
-par1_grid <- seq(0.25, 2.50, by = 0.10)   # τ  (23 values: 0.25 … 2.50)
-par2_grid <- seq(20,  100,   by = 10)      # RET_WINDOW days  (9 values: 20 … 100)
+# par1: Signal threshold τ  — how extreme a Kalman z-score must be to trade
+# par2: Kalman process noise Q — controls filter responsiveness.
+#       Low Q  → slow-adapting, smoother state, fewer signal flips (like long MA)
+#       High Q → fast-adapting, reactive state, more signal flips (like short MA)
+#       Directly analogous to the professor's short-MA vs long-MA parameter pair.
+par1_grid <- seq(0.25, 2.50, by = 0.10)                        # τ  — 23 values
+par2_grid <- round(seq(0.0001, 0.005, length.out = 9), 6)      # Q  —  9 values
 
 out <- expand.grid(
   par1value = par1_grid,
@@ -1800,59 +1801,21 @@ out <- expand.grid(
 )
 
 cat("Running 2-parameter grid:", nrow(out), "combinations",
-    "(", length(par1_grid), "τ ×", length(par2_grid), "RET_WINDOW)...\n")
+    "(", length(par1_grid), "τ ×", length(par2_grid), "KF_Q)...\n")
 
-# ── Pre-compute Kalman z-scores for each unique ret_window (9 runs, not 207) ──
-# Expensive work (rolling return → residuals → Kalman) depends only on
-# ret_window, not τ.  Cache once per window; eval_params then does only
-# cheap signal / position / return aggregation.
-
-sector_daily_base <- returns_daily |>
-  filter(symbol %in% SECTOR_TICKERS) |>
-  arrange(symbol, date) |>
-  select(symbol, date, retClCl)
-
-cluster_daily_slim <- cluster_daily |> select(symbol, date, cluster)
-
+# ── Pre-compute Kalman z-scores for each unique Q value (9 fast Kalman runs) ───
+# residuals_daily is ALREADY in memory — no slide_dbl needed at all.
+# kalman_local_level() is a simple sequential arithmetic loop (~6 000 obs/symbol)
+# not an R closure, so 9 × 11 symbols completes in well under a second.
 kf_cache <- purrr::map(
   setNames(par2_grid, par2_grid),
-  function(rw) {
-    n <- as.integer(rw)
-
-    # Step 1 — rolling cumulative return (same slide_dbl used in roll_cum_ret)
-    cum_ret_w <- sector_daily_base |>
-      group_by(symbol) |>
-      mutate(
-        cum_ret = slider::slide_dbl(
-          retClCl,
-          .f        = ~ prod(1 + .x, na.rm = FALSE) - 1,
-          .before   = n - 1L,
-          .complete = TRUE
-        )
-      ) |>
-      ungroup() |>
-      select(symbol, date, cum_ret)
-
-    # Step 2 — leave-one-out cluster-peer mean → residual
-    resid_w <- cum_ret_w |>
-      left_join(cluster_daily_slim, by = c("symbol", "date")) |>
-      filter(!is.na(cluster), !is.na(cum_ret)) |>
-      group_by(date, cluster) |>
-      mutate(
-        cluster_sum = sum(cum_ret, na.rm = TRUE),
-        cluster_n   = sum(!is.na(cum_ret)),
-        peer_mean   = (cluster_sum - cum_ret) / (cluster_n - 1L)
-      ) |>
-      ungroup() |>
-      mutate(residual = cum_ret - peer_mean) |>
-      filter(!is.na(residual))
-
-    # Step 3 — Kalman filter per symbol
-    resid_w |>
+  function(q_val) {
+    residuals_daily |>
+      filter(!is.na(residual)) |>
       arrange(symbol, date) |>
       group_by(symbol) |>
       group_modify(~ {
-        kf <- kalman_local_level(.x$residual, Q = KF_Q, R = KF_R)
+        kf <- kalman_local_level(.x$residual, Q = q_val, R = KF_R)
         mutate(.x, kf_z = kf$z_score)
       }) |>
       ungroup() |>
@@ -1861,15 +1824,14 @@ kf_cache <- purrr::map(
   }
 )
 
-cat("Pre-computed Kalman z-scores for", length(kf_cache), "lookback windows.\n")
+cat("Kalman cache ready for", length(kf_cache), "Q values.\n")
 
-# ── Strategy function (signal/position/return only — fast per call) ────────────
-# Mirrors professor's pattern: strategy as a function, grid iterated in parallel.
-# Professor uses RTL::tradeStrategySMA (single-ticker SMA, ms per call).
-# Our multi-ETF cluster strategy is heavier, hence the kf_cache pre-computation
-# above reduces the per-call cost to the same cheap aggregation pattern.
-eval_params <- function(tau, ret_window) {
-  kf_monthly <- kf_cache[[as.character(ret_window)]]
+# ── Strategy function — mirrors professor's §8.7.3 pattern exactly ─────────────
+# Professor: strategy(data, par1value, par2value) → computes indicators + signals
+# Ours:      eval_params(tau, kf_q)             → look up cached z-scores + signals
+# Both return per-period returns; RTL::tradeStats / trade_stats summarise them.
+eval_params <- function(tau, kf_q) {
+  kf_monthly <- kf_cache[[as.character(kf_q)]]
 
   sigs <- kf_monthly |>
     mutate(signal = case_when(
@@ -1895,7 +1857,7 @@ eval_params <- function(tau, ret_window) {
     summarise(strategy_ret = sum(weight * monthly_ret, na.rm = TRUE), .groups = "drop")
 
   if (nrow(strat_ret) < 12L) {
-    return(tibble(par1value = tau,    par2value = ret_window,
+    return(tibble(par1value = tau,  par2value = kf_q,
                   CumReturn = NA_real_, Ret.Ann = NA_real_, SD.Ann = NA_real_,
                   Sharpe    = NA_real_, Omega   = NA_real_, `%.Win` = NA_real_,
                   `%.InMrkt` = NA_real_, DD.Length = NA_integer_, DD.Max = NA_real_,
@@ -1903,12 +1865,10 @@ eval_params <- function(tau, ret_window) {
   }
 
   m <- trade_stats(strat_ret$strategy_ret)
-  bind_cols(tibble(par1value = tau, par2value = ret_window), m)
+  bind_cols(tibble(par1value = tau, par2value = kf_q), m)
 }
 
-# ── Run all 207 combinations ───────────────────────────────────────────────────
-# kf_cache pre-computation reduces per-call cost to cheap signal/position/return
-# aggregation only, so sequential purrr::map2_dfr completes in well under 1 min.
+# ── Run all 207 combinations (purrr::map2_dfr — fast, no recomputation) ────────
 out <- purrr::map2_dfr(
   out$par1value,
   out$par2value,
@@ -1918,10 +1878,10 @@ out <- purrr::map2_dfr(
 cat("Grid complete.\n")
 cat("Best Sharpe    :", round(max(out$Sharpe,    na.rm = TRUE), 3),
     "at τ =", out$par1value[which.max(out$Sharpe)],
-    "/ RET_WINDOW =", out$par2value[which.max(out$Sharpe)], "days\n")
+    "/ KF_Q =", out$par2value[which.max(out$Sharpe)], "\n")
 cat("Best CumReturn :", round(max(out$CumReturn, na.rm = TRUE), 3),
     "at τ =", out$par1value[which.max(out$CumReturn)],
-    "/ RET_WINDOW =", out$par2value[which.max(out$CumReturn)], "days\n")
+    "/ KF_Q =", out$par2value[which.max(out$CumReturn)], "\n")
 ```
 
 ```{r wireframe-cumreturn}
@@ -1935,7 +1895,7 @@ wireframe(
   colorkey = list(space = "right"),
   main     = "Cumulative Return",
   xlab     = "par1: Signal Threshold (τ)",
-  ylab     = "par2: Residual Lookback (days)",
+  ylab     = "par2: Kalman Process Noise (Q)",
   zlab     = "CumReturn"
 )
 ```
@@ -1949,7 +1909,7 @@ out |>
   geom_raster(aes(fill = CumReturn), interpolate = TRUE) +
   scale_fill_gradient2(low = "red", mid = "white", high = "blue",
                        midpoint = median(out$CumReturn, na.rm = TRUE)) +
-  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = RET_WINDOW),
+  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = KF_Q),
              shape = 3, size = 5, color = "black", stroke = 1.5) +
   scale_x_continuous(breaks = par1_grid) +
   scale_y_continuous(breaks = par2_grid) +
@@ -1963,12 +1923,12 @@ out |>
   labs(
     title    = "Optimization Results Grid — CumReturn",
     subtitle = paste0(
-      "par1 = Signal Threshold (τ)  |  par2 = Residual Lookback (days)\n",
+      "par1 = Signal Threshold (τ)  |  par2 = Kalman Process Noise (Q)\n",
       "Cross = chosen parameters (τ = ", SIGNAL_THRESHOLD,
-      ", RET_WINDOW = ", RET_WINDOW, " days)"
+      ", KF_Q = ", KF_Q, ")"
     ),
     x    = "par1value — Signal Threshold (τ)",
-    y    = "par2value — Residual Lookback (days)",
+    y    = "par2value — Kalman Process Noise (Q)",
     fill = "CumReturn"
   )
 
@@ -1979,7 +1939,7 @@ out |>
   geom_raster(aes(fill = Sharpe), interpolate = TRUE) +
   scale_fill_gradient2(low = "red", mid = "white", high = "blue",
                        midpoint = median(out$Sharpe, na.rm = TRUE)) +
-  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = RET_WINDOW),
+  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = KF_Q),
              shape = 3, size = 5, color = "black", stroke = 1.5) +
   scale_x_continuous(breaks = par1_grid) +
   scale_y_continuous(breaks = par2_grid) +
@@ -1994,7 +1954,7 @@ out |>
     title    = "Optimization Results Grid — Sharpe Ratio",
     subtitle = "Smooth region = robust | Cliff-like = overfit",
     x = "par1value — Signal Threshold (τ)",
-    y = "par2value — Residual Lookback (days)",
+    y = "par2value — Kalman Process Noise (Q)",
     fill = "Sharpe"
   )
 ```
@@ -2024,7 +1984,7 @@ plotly::plot_ly(
   plotly::layout(
     title = "3D Optimization Surface — CumReturn",
     scene = list(
-      xaxis = list(title = "par2: Residual Lookback (days)"),
+      xaxis = list(title = "par2: Kalman Process Noise (Q)"),
       yaxis = list(title = "par1: Signal Threshold (τ)"),
       zaxis = list(title = "CumReturn")
     )
@@ -2044,7 +2004,7 @@ wireframe(
   colorkey = list(space = "right"),
   main     = "Sharpe Ratio",
   xlab     = "par1: Signal Threshold (τ)",
-  ylab     = "par2: Residual Lookback (days)",
+  ylab     = "par2: Kalman Process Noise (Q)",
   zlab     = "Sharpe"
 )
 
@@ -2056,7 +2016,7 @@ wireframe(
   colorkey = list(space = "right"),
   main     = "Cumulative Return",
   xlab     = "par1: Signal Threshold (τ)",
-  ylab     = "par2: Residual Lookback (days)",
+  ylab     = "par2: Kalman Process Noise (Q)",
   zlab     = "CumReturn"
 )
 
@@ -2068,7 +2028,7 @@ wireframe(
   colorkey = list(space = "right"),
   main     = "Maximum Drawdown",
   xlab     = "par1: Signal Threshold (τ)",
-  ylab     = "par2: Residual Lookback (days)",
+  ylab     = "par2: Kalman Process Noise (Q)",
   zlab     = "DD.Max"
 )
 ```
@@ -2100,7 +2060,7 @@ plotly::plot_ly(
   plotly::layout(
     title = "3D Optimization Surface — Maximum Drawdown",
     scene = list(
-      xaxis = list(title = "par2: Residual Lookback (days)"),
+      xaxis = list(title = "par2: Kalman Process Noise (Q)"),
       yaxis = list(title = "par1: Signal Threshold (τ)"),
       zaxis = list(title = "DD.Max")
     )
@@ -2158,9 +2118,9 @@ outZ |>
   ) +
   labs(
     title    = "Optimization Results Grid",
-    subtitle = "Z-score for Comparability | par1 = Signal Threshold (τ)  |  par2 = Residual Lookback (days)",
+    subtitle = "Z-score for Comparability | par1 = Signal Threshold (τ)  |  par2 = Kalman Process Noise (Q)",
     x        = "par1value — Signal Threshold (τ)",
-    y        = "par2value — Residual Lookback (days)",
+    y        = "par2value — Kalman Process Noise (Q)",
     fill     = "Z-score"
   )
 ```
