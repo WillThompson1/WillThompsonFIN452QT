@@ -617,6 +617,17 @@ By grouping sectors into behavioral clusters first — and then measuring each E
 The diagram below captures the complete decision logic, from problem framing through signal generation to out-of-sample validation. Every component in the R implementation traces back to a specific node in this model. Clustering defines comparability. The Kalman filter refines it. The z-score triggers it. The decision rules execute it.
 
 ```{=html}
+<style>
+.mermaid-container {
+  overflow: auto;
+  border: 2px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 20px;
+  background: #ffffff;
+  max-height: 680px;
+  cursor: grab;
+}
+</style>
 <div style="text-align:center; margin:10px 0 6px 0;">
   <button onclick="mzoom(1.25)"
     style="padding:5px 14px;margin:3px;border-radius:5px;border:1px solid #94a3b8;
@@ -638,11 +649,9 @@ The diagram below captures the complete decision logic, from problem framing thr
     100%
   </span>
 </div>
-<div id="mermaid-zoom-wrap"
-  style="overflow:auto; border:2px solid #e2e8f0; border-radius:10px;
-         padding:20px; background:#ffffff; max-height:680px; cursor:grab;">
 ```
 
+:::{.mermaid-container}
 ```{mermaid}
 %%| fig-width: 10
 %%| fig-height: 16
@@ -747,13 +756,14 @@ flowchart TD
     VA -->|"Reflect & refine parameters"| CL
 ```
 
+:::
+
 ```{=html}
-</div>
 <script>
 (function () {
   var scale = 1;
   function getSvg() {
-    return document.querySelector('#mermaid-zoom-wrap svg');
+    return document.querySelector('.mermaid-container svg');
   }
   function applyScale() {
     var svg = getSvg();
