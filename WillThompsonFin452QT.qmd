@@ -234,9 +234,9 @@ roll_beta <- function(x, y, n) {
 }
 
 roll_cum_ret <- function(x, n) {
-  slider::slide_dbl(x,
-    .f = ~ prod(1 + .x, na.rm = FALSE) - 1,
-    .before = n - 1L, .complete = TRUE)
+  # slide_sum over log-returns + expm1 uses slider's fast C loop
+  # mathematically identical to prod(1+r_i)-1 up to float rounding
+  expm1(slider::slide_sum(log1p(x), before = n - 1L, complete = TRUE))
 }
 
 # ── Compute features for all sector ETFs ──────────────────────────────────────
@@ -1808,23 +1808,24 @@ cat("Running 2-parameter grid:", nrow(grid_params), "combinations",
 sector_daily_base <- returns_daily |>
   filter(symbol %in% SECTOR_TICKERS) |>
   arrange(symbol, date) |>
-  select(symbol, date, retClCl)
+  # Pre-compute log(1+r) once; slide_sum() over log-rets is a fast C loop
+  # vs slide_dbl(~prod(...)) which calls an R closure ~66k times per window
+  mutate(log_ret = log1p(retClCl)) |>
+  select(symbol, date, retClCl, log_ret)
 
 cluster_daily_slim <- cluster_daily |> select(symbol, date, cluster)
 
 kf_cache <- purrr::map(
   setNames(par2_grid, par2_grid),
   function(rw) {
-    # Step 1 — rolling cumulative return
+    n <- as.integer(rw)
+
+    # Step 1 — rolling cumulative return via log-return sum (fast C path)
+    # exp(sum(log(1+r_i))) - 1  ≡  prod(1+r_i) - 1  (exact up to float rounding)
     cum_ret_w <- sector_daily_base |>
       group_by(symbol) |>
       mutate(
-        cum_ret = slider::slide_dbl(
-          retClCl,
-          ~ prod(1 + .x, na.rm = FALSE) - 1,
-          .before   = as.integer(rw) - 1L,
-          .complete = TRUE
-        )
+        cum_ret = expm1(slider::slide_sum(log_ret, before = n - 1L, complete = TRUE))
       ) |>
       ungroup() |>
       select(symbol, date, cum_ret)
