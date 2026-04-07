@@ -327,9 +327,9 @@ returns_daily <- prices |>
   group_by(symbol) |>
   arrange(date) |>
   mutate(
-    retClCl = adjusted / lag(adjusted) - 1,           # Close-to-close (hold overnight)
+    retClCl = adjusted / dplyr::lag(adjusted) - 1,    # Close-to-close (hold overnight)
     retOpCl = (close - open) / close,                 # Open-to-close same day (intraday)
-    retClOp = open / lag(adjusted) - 1                # Prior close to open (gap return)
+    retClOp = open / dplyr::lag(adjusted) - 1         # Prior close to open (gap return)
   ) |>
   ungroup() |>
   filter(!is.na(retClCl))
@@ -1204,7 +1204,7 @@ monthly_prices <- prices |>
 monthly_ret_tbl <- monthly_prices |>
   group_by(symbol) |>
   arrange(date) |>
-  mutate(monthly_ret = adjusted / lag(adjusted) - 1) |>
+  mutate(monthly_ret = adjusted / dplyr::lag(adjusted) - 1) |>
   ungroup() |>
   filter(!is.na(monthly_ret))
 
@@ -1668,7 +1668,7 @@ ggplot(ret_df_viz, aes(x = ret)) +
 turnover_df <- positions_all |>
   arrange(symbol, date) |>
   group_by(symbol) |>
-  mutate(weight_lag = lag(weight)) |>
+  mutate(weight_lag = dplyr::lag(weight)) |>
   ungroup() |>
   group_by(date) |>
   summarise(
