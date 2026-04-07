@@ -1112,17 +1112,27 @@ signals_monthly |>
 build_positions <- function(signals_df,
                             max_longs  = MAX_LONGS,
                             max_shorts = MAX_SHORTS) {
-  longs  <- signals_df |> filter(signal == "LONG")  |> arrange(kf_z)        |> head(max_longs)
-  shorts <- signals_df |> filter(signal == "SHORT") |> arrange(desc(kf_z))  |> head(max_shorts)
+  longs  <- signals_df |> filter(signal == "LONG")  |> arrange(kf_z)       |> head(max_longs)
+  shorts <- signals_df |> filter(signal == "SHORT") |> arrange(desc(kf_z)) |> head(max_shorts)
   n_long <- nrow(longs); n_short <- nrow(shorts)
 
+  # If no signals clear the threshold, return a typed empty tibble.
+  # bind_rows(tibble(), tibble()) produces a 0-col tibble; select() then
+  # errors with "column doesn't exist". The typed return avoids that.
+  if (n_long == 0L && n_short == 0L) {
+    return(tibble(symbol  = character(),
+                  signal  = character(),
+                  kf_z    = numeric(),
+                  cluster = integer(),
+                  weight  = numeric()))
+  }
+
   bind_rows(
-    if (n_long  > 0) mutate(longs,  weight =  1 / n_long)  else tibble(),
-    if (n_short > 0) mutate(shorts, weight = -1 / n_short) else tibble()
+    if (n_long  > 0L) mutate(longs,  weight =  1 / n_long)  else tibble(),
+    if (n_short > 0L) mutate(shorts, weight = -1 / n_short) else tibble()
   ) |>
-    # Drop 'date' here — group_modify() strips the grouping column from .x
-    # before passing it in, then adds it back automatically to the output.
-    # Selecting 'date' inside the function would error with "column doesn't exist".
+    # Note: 'date' is omitted — group_modify() strips the grouping column
+    # from .x before passing it in and re-attaches it to the output.
     select(symbol, signal, kf_z, cluster, weight)
 }
 
