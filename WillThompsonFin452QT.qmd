@@ -559,10 +559,14 @@ cluster_hierarchical <- function(feature_mat, k = N_CLUSTERS, method = LINK_METH
 
 # ── K-Means clustering ────────────────────────────────────────────────────────
 cluster_kmeans <- function(feature_mat, k = N_CLUSTERS, seed = 42L) {
-  scaled <- standardize_features(feature_mat)
+  scaled     <- standardize_features(feature_mat)
+  # recipes::bake() drops rownames — restore them so kmeans() assignments
+  # are named by ETF symbol and can be indexed by name downstream.
+  scaled_mat <- as.matrix(scaled)
+  rownames(scaled_mat) <- rownames(feature_mat)
   set.seed(seed)
-  km <- stats::kmeans(scaled, centers = k, nstart = 25L)
-  list(assignments = km$cluster, kmeans_obj = km, scaled = scaled)
+  km <- stats::kmeans(scaled_mat, centers = k, nstart = 25L)
+  list(assignments = km$cluster, kmeans_obj = km, scaled = scaled_mat)
 }
 
 # ── Apply clustering at a single rebalance date ────────────────────────────────
