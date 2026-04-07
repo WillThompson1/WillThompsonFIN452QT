@@ -1120,7 +1120,10 @@ build_positions <- function(signals_df,
     if (n_long  > 0) mutate(longs,  weight =  1 / n_long)  else tibble(),
     if (n_short > 0) mutate(shorts, weight = -1 / n_short) else tibble()
   ) |>
-    select(date, symbol, signal, kf_z, cluster, weight)
+    # Drop 'date' here — group_modify() strips the grouping column from .x
+    # before passing it in, then adds it back automatically to the output.
+    # Selecting 'date' inside the function would error with "column doesn't exist".
+    select(symbol, signal, kf_z, cluster, weight)
 }
 
 positions_all <- signals_monthly |>
