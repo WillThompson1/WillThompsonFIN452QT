@@ -1361,24 +1361,53 @@ cat("Testing  months:", sum(backtest_df$period == "Testing"), "\n")
 The backtest runs monthly close-to-close from June 2000 through March 2026 with a strict temporal split. No future information enters the signal generation or Kalman initialization. The cumulative equity chart shows both training and testing period performance against SPY. The training/testing facet chart rebases each period to zero for direct comparison. The trade statistics table summarizes the key performance metrics across both periods with SPY as the benchmark.
 
 ```{r strategy-chart}
-# Build monthly xts of strategy and SPY returns
+# Net exposure at each return month (sum of weights: +1 = fully long, -1 = fully short)
+net_pos_monthly <- positions_all |>
+  group_by(date) |>
+  summarise(net_pos = sum(weight), .groups = "drop") |>
+  rename(signal_date = date) |>
+  left_join(next_month_map, by = "signal_date") |>
+  filter(!is.na(return_date)) |>
+  select(return_date, net_pos)
+
+# Build monthly xts including net position exposure
 backtest_xts <- backtest_df |>
   select(return_date, strategy_ret, spy_ret) |>
-  mutate(cum_strat = cumprod(1 + strategy_ret),
-         cum_spy   = cumprod(1 + spy_ret)) |>
+  left_join(net_pos_monthly, by = "return_date") |>
+  mutate(
+    cum_strat = cumprod(1 + strategy_ret),
+    cum_spy   = cumprod(1 + spy_ret),
+    net_pos   = replace_na(net_pos, 0)
+  ) |>
   timetk::tk_xts(date_var = return_date)
 
-# Plot cumulative equity (course-style xts chart)
+# 4-panel course-style xts chart matching §8.4.4 / §8.10 format:
+#   Panel 1: CumEQ (Strategy vs SPY overlay)
+#   Panel 2: Positions — net directional exposure (sum of weights)
+#   Panel 3: Monthly Return bars
 plot(backtest_xts$cum_strat,
-     main  = "Cumulative Equity — Strategy vs SPY",
+     main  = "Strategy Results",
      col   = "#1565C0",
      ylab  = "Growth of $1")
 xts::addSeries(backtest_xts$cum_spy,
-     main = "SPY", on = NA,
+     main = "SPY", on = 1,
      type = "l", col = "#E65100", lty = 2, lwd = 1.5, pch = 0)
+xts::addSeries(backtest_xts$net_pos,
+     main = "Positions",
+     on   = NA,
+     type = "h",
+     col  = "blue",
+     lty  = 1,
+     lwd  = 1,
+     pch  = 0)
 xts::addSeries(backtest_xts$strategy_ret,
-     main = "Monthly Return", on = NA,
-     type = "h", col = "#1565C0", lty = 1, lwd = 1, pch = 0)
+     main = "Monthly Return",
+     on   = NA,
+     type = "h",
+     col  = "#1565C0",
+     lty  = 1,
+     lwd  = 1,
+     pch  = 0)
 ```
 
 ```{r cum-returns}
@@ -1797,12 +1826,14 @@ eval_params <- function(tau, max_pos) {
 
   if (nrow(strat_ret) < 12L) {
     return(tibble(par1value = tau, par2value = max_pos,
-                  CumReturn = NA_real_, Sharpe = NA_real_, DD.Max = NA_real_))
+                  CumReturn = NA_real_, Ret.Ann = NA_real_, SD.Ann = NA_real_,
+                  Sharpe = NA_real_, Omega = NA_real_, `%.Win` = NA_real_,
+                  `%.InMrkt` = NA_real_, DD.Length = NA_integer_, DD.Max = NA_real_,
+                  N.Trades = NA_integer_, N.Months = NA_integer_))
   }
 
   m <- trade_stats(strat_ret$strategy_ret)
-  tibble(par1value = tau, par2value = max_pos,
-         CumReturn = m$CumReturn, Sharpe = m$Sharpe, DD.Max = m$DD.Max)
+  bind_cols(tibble(par1value = tau, par2value = max_pos), m)
 }
 
 # ── Run all combinations ───────────────────────────────────────────────────────
@@ -1821,8 +1852,24 @@ cat("Best CumReturn :", round(max(out$CumReturn, na.rm = TRUE), 3),
     "/ max_pos =", out$par2value[which.max(out$CumReturn)], "\n")
 ```
 
+```{r wireframe-cumreturn}
+# §8.7.5 Optimization Visualization — Method 1: lattice::wireframe (matching class notes)
+library(lattice)
+wireframe(
+  out$CumReturn ~ out$par1value * out$par2value,
+  scales   = list(arrows = FALSE),
+  shade    = TRUE,
+  drape    = TRUE,
+  colorkey = list(space = "right"),
+  main     = "Cumulative Return",
+  xlab     = "par1: Signal Threshold (τ)",
+  ylab     = "par2: Max Positions per Side",
+  zlab     = "CumReturn"
+)
+```
+
 ```{r opt-grid-2d}
-# Matching the class notes code exactly:
+# §8.7.5 Optimization Visualization — Method 3: geom_raster (matching class notes exactly)
 # geom_raster with interpolate = TRUE for smooth gradient
 out |>
   dplyr::select(par1value, par2value, CumReturn) |>
@@ -1881,6 +1928,7 @@ out |>
 ```
 
 ```{r opt-grid-3d}
+# §8.7.5 Optimization Visualization — Method 2: plotly add_surface for CumReturn
 # Matching the class notes code exactly:
 # pivot_wider → matrix → plot_ly %>% add_surface()
 par2_vals <- unique(out$par2value)
@@ -1908,6 +1956,140 @@ plotly::plot_ly(
       yaxis = list(title = "par1: Signal Threshold (τ)"),
       zaxis = list(title = "CumReturn")
     )
+  )
+```
+
+```{r wireframe-risk-appetite}
+# §8.8.9 Defining Our Risk Appetite — lattice::wireframe visualizations
+# Class notes: wireframe for Sharpe, then CumReturn, then DD.Max
+library(lattice)
+
+wireframe(
+  out$Sharpe ~ out$par1value * out$par2value,
+  scales   = list(arrows = FALSE),
+  shade    = TRUE,
+  drape    = TRUE,
+  colorkey = list(space = "right"),
+  main     = "Sharpe Ratio",
+  xlab     = "par1: Signal Threshold (τ)",
+  ylab     = "par2: Max Positions per Side",
+  zlab     = "Sharpe"
+)
+
+wireframe(
+  out$CumReturn ~ out$par1value * out$par2value,
+  scales   = list(arrows = FALSE),
+  shade    = TRUE,
+  drape    = TRUE,
+  colorkey = list(space = "right"),
+  main     = "Cumulative Return",
+  xlab     = "par1: Signal Threshold (τ)",
+  ylab     = "par2: Max Positions per Side",
+  zlab     = "CumReturn"
+)
+
+wireframe(
+  out$DD.Max ~ out$par1value * out$par2value,
+  scales   = list(arrows = FALSE),
+  shade    = TRUE,
+  drape    = TRUE,
+  colorkey = list(space = "right"),
+  main     = "Maximum Drawdown",
+  xlab     = "par1: Signal Threshold (τ)",
+  ylab     = "par2: Max Positions per Side",
+  zlab     = "DD.Max"
+)
+```
+
+```{r opt-grid-3d-drawdowns}
+# §8.8.9 — plotly add_surface for DrawDowns (matching class notes exactly)
+# Class notes: plot_ly(x=~par2, y=~par1, z=~DrawDowns) %>% add_surface()
+Sharpe_mat <- out |>
+  dplyr::select(par1value, par2value, Sharpe) |>
+  tidyr::pivot_wider(values_from = Sharpe, names_from = par2value) |>
+  dplyr::select(-1) |>
+  as.matrix()
+
+DrawDowns_mat <- out |>
+  dplyr::select(par1value, par2value, DD.Max) |>
+  tidyr::pivot_wider(values_from = DD.Max, names_from = par2value) |>
+  dplyr::select(-1) |>
+  as.matrix()
+
+plotly::plot_ly(
+  x = ~ par2_vals,
+  y = ~ par1_vals,
+  z = ~ DrawDowns_mat
+) |>
+  plotly::add_surface(
+    colorscale = list(c(0, 1), c("red", "blue")),
+    showscale  = TRUE
+  ) |>
+  plotly::layout(
+    title = "3D Optimization Surface — Maximum Drawdown",
+    scene = list(
+      xaxis = list(title = "par2: Max Positions"),
+      yaxis = list(title = "par1: Signal Threshold (τ)"),
+      zaxis = list(title = "DD.Max")
+    )
+  )
+```
+
+```{r zscore-histogram}
+# §8.8.9.1 Z Score — normalize all tradeStats metrics for comparability
+# Matching class notes: outZ %>% ggplot(aes(x=valueZ)) + geom_histogram + facet_wrap(~variable)
+outZ <- out |>
+  tidyr::pivot_longer(
+    cols      = -c(par1value, par2value),
+    names_to  = "variable",
+    values_to = "value"
+  ) |>
+  dplyr::group_by(variable) |>
+  dplyr::mutate(valueZ = (value - mean(value, na.rm = TRUE)) / sd(value, na.rm = TRUE)) |>
+  dplyr::ungroup() |>
+  filter(variable %in% c("CumReturn", "Ret.Ann", "SD.Ann", "Sharpe",
+                          "Omega", "%.Win", "%.InMrkt", "DD.Length", "DD.Max"))
+
+outZ |>
+  ggplot(aes(x = valueZ)) +
+  geom_histogram(color = "black", fill = "blue",
+                 aes(y = after_stat(density)), bins = 20) +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    title    = "Z-Score Distributions — All tradeStats Metrics",
+    subtitle = "Optimization Results Grid — Z-score for Comparability",
+    x        = "Z-score (valueZ)",
+    y        = "Density"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r zscore-raster-facet}
+# §8.8.9.1 Z Score — geom_raster facet_wrap(~variable) for all metrics
+# Matching class notes exactly: "Optimization Results Grid — Z-score for Comparability"
+outZ |>
+  ggplot(aes(x = par1value, y = par2value)) +
+  geom_raster(aes(fill = valueZ), interpolate = TRUE) +
+  facet_wrap(~ variable, scales = "free") +
+  scale_fill_gradient2(
+    low      = "red",
+    mid      = "white",
+    high     = "blue",
+    midpoint = 0
+  ) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.background   = element_rect(fill = "white")
+  ) +
+  labs(
+    title    = "Optimization Results Grid",
+    subtitle = "Z-score for Comparability | par1 = Signal Threshold (τ)  |  par2 = Max Positions per Side",
+    x        = "par1value — Signal Threshold (τ)",
+    y        = "par2value — Max Positions per Side",
+    fill     = "Z-score"
   )
 ```
 
