@@ -551,8 +551,13 @@ standardize_features <- function(df) {
 
 # ── Hierarchical clustering (Ward.D2) ─────────────────────────────────────────
 cluster_hierarchical <- function(feature_mat, k = N_CLUSTERS, method = LINK_METHOD) {
-  scaled   <- standardize_features(feature_mat)
-  dist_mat <- dist(scaled, method = "euclidean")
+  scaled     <- standardize_features(feature_mat)
+  # recipes::bake() strips rownames → dist() gets no labels → cutree() returns
+  # an unnamed vector → names(assignments) == NULL → downstream subsetting breaks.
+  # Restore rownames before computing distances so cutree() is ETF-symbol named.
+  scaled_mat <- as.matrix(scaled)
+  rownames(scaled_mat) <- rownames(feature_mat)
+  dist_mat <- dist(scaled_mat, method = "euclidean")
   hc       <- hclust(dist_mat, method = method)
   list(assignments = cutree(hc, k = k), hclust_obj = hc, dist_mat = dist_mat)
 }
