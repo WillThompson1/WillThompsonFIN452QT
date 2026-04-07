@@ -1120,20 +1120,20 @@ build_positions <- function(signals_df,
   # bind_rows(tibble(), tibble()) produces a 0-col tibble; select() then
   # errors with "column doesn't exist". The typed return avoids that.
   if (n_long == 0L && n_short == 0L) {
-    return(tibble(symbol  = character(),
-                  signal  = character(),
-                  kf_z    = numeric(),
-                  cluster = integer(),
-                  weight  = numeric()))
+    return(tibble(symbol = character(),
+                  signal = character(),
+                  kf_z   = numeric(),
+                  weight = numeric()))
   }
 
   bind_rows(
     if (n_long  > 0L) mutate(longs,  weight =  1 / n_long)  else tibble(),
     if (n_short > 0L) mutate(shorts, weight = -1 / n_short) else tibble()
   ) |>
-    # Note: 'date' is omitted — group_modify() strips the grouping column
-    # from .x before passing it in and re-attaches it to the output.
-    select(symbol, signal, kf_z, cluster, weight)
+    # Note: 'date' is omitted — group_modify() strips it from .x and re-attaches it.
+    # 'cluster' is selected with any_of() so the function works whether or not
+    # the caller includes cluster (main backtest does; sensitivity sweeps don't).
+    select(symbol, signal, kf_z, any_of("cluster"), weight)
 }
 
 positions_all <- signals_monthly |>
