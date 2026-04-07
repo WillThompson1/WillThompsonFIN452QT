@@ -1785,19 +1785,69 @@ sensitivity_tau |>
 #| cache: true
 
 # ── Define 2-parameter grid ────────────────────────────────────────────────────
-par1_grid <- seq(0.50, 2.00, by = 0.25)   # Signal threshold τ (7 values)
-par2_grid <- 1:5                           # Max positions per side (5 values)
+# par1: Signal threshold τ — controls how extreme a z-score must be to trade
+# par2: Residual lookback window (trading days) — changes the cumulative-return
+#        period from which cluster-relative residuals are computed.
+#        Shorter windows → faster signals; longer windows → smoother, lower-freq.
+par1_grid <- seq(0.25, 2.50, by = 0.10)   # τ  (23 values: 0.25 … 2.50)
+par2_grid <- seq(20,  100,   by = 10)      # RET_WINDOW days  (9 values: 20 … 100)
 
 grid_params <- expand_grid(
   par1value = par1_grid,   # tau
-  par2value = par2_grid    # max_pos
+  par2value = par2_grid    # ret_window
 )
 
-cat("Running 2-parameter grid:", nrow(grid_params), "combinations...\n")
+cat("Running 2-parameter grid:", nrow(grid_params), "combinations",
+    "(", length(par1_grid), "× τ  ×", length(par2_grid), "× RET_WINDOW)...\n")
 
-# ── Evaluation function for a single (tau, max_pos) pair ──────────────────────
-eval_params <- function(tau, max_pos) {
-  sigs <- kalman_results |>
+# ── Evaluation function for a single (tau, ret_window) pair ───────────────────
+# Reuses from global env: returns_daily, cluster_daily, kalman_local_level,
+#   monthly_ret_tbl, next_month_map, train_month_ends, build_positions, trade_stats
+eval_params <- function(tau, ret_window) {
+
+  # Step 1: Recompute rolling cumulative returns for this lookback window
+  cum_ret_w <- returns_daily |>
+    filter(symbol %in% SECTOR_TICKERS) |>
+    arrange(symbol, date) |>
+    group_by(symbol) |>
+    mutate(
+      cum_ret = slider::slide_dbl(
+        retClCl,
+        ~ prod(1 + .x, na.rm = FALSE) - 1,
+        .before  = as.integer(ret_window) - 1L,
+        .complete = TRUE
+      )
+    ) |>
+    ungroup() |>
+    select(symbol, date, cum_ret)
+
+  # Step 2: Join cluster assignments + leave-one-out peer mean
+  resid_w <- cum_ret_w |>
+    left_join(cluster_daily |> select(symbol, date, cluster),
+              by = c("symbol", "date")) |>
+    filter(!is.na(cluster), !is.na(cum_ret)) |>
+    group_by(date, cluster) |>
+    mutate(
+      cluster_sum = sum(cum_ret, na.rm = TRUE),
+      cluster_n   = sum(!is.na(cum_ret)),
+      peer_mean   = (cluster_sum - cum_ret) / (cluster_n - 1L)
+    ) |>
+    ungroup() |>
+    mutate(residual = cum_ret - peer_mean) |>
+    filter(!is.na(residual))
+
+  # Step 3: Kalman filter per symbol on new residual series
+  kf_w <- resid_w |>
+    arrange(symbol, date) |>
+    group_by(symbol) |>
+    group_modify(~ {
+      kf <- kalman_local_level(.x$residual, Q = KF_Q, R = KF_R)
+      mutate(.x, kf_z = kf$z_score)
+    }) |>
+    ungroup()
+
+  # Step 4: Signals at training month-ends
+  sigs <- kf_w |>
     filter(date %in% train_month_ends, !is.na(kf_z)) |>
     select(date, symbol, kf_z) |>
     mutate(signal = case_when(
@@ -1806,13 +1856,13 @@ eval_params <- function(tau, max_pos) {
       TRUE        ~ "NEUTRAL"
     ))
 
+  # Step 5: Build positions (use strategy defaults for max_longs / max_shorts)
   pos <- sigs |>
     group_by(date) |>
-    group_modify(~ build_positions(.x,
-                                   max_longs  = max_pos,
-                                   max_shorts = max_pos)) |>
+    group_modify(~ build_positions(.x)) |>
     ungroup()
 
+  # Step 6: Strategy returns
   strat_ret <- pos |>
     rename(signal_date = date) |>
     left_join(next_month_map |> filter(signal_date %in% train_month_ends),
@@ -1825,15 +1875,15 @@ eval_params <- function(tau, max_pos) {
     summarise(strategy_ret = sum(weight * monthly_ret, na.rm = TRUE), .groups = "drop")
 
   if (nrow(strat_ret) < 12L) {
-    return(tibble(par1value = tau, par2value = max_pos,
+    return(tibble(par1value = tau,    par2value = ret_window,
                   CumReturn = NA_real_, Ret.Ann = NA_real_, SD.Ann = NA_real_,
-                  Sharpe = NA_real_, Omega = NA_real_, `%.Win` = NA_real_,
+                  Sharpe    = NA_real_, Omega   = NA_real_, `%.Win` = NA_real_,
                   `%.InMrkt` = NA_real_, DD.Length = NA_integer_, DD.Max = NA_real_,
                   N.Trades = NA_integer_, N.Months = NA_integer_))
   }
 
   m <- trade_stats(strat_ret$strategy_ret)
-  bind_cols(tibble(par1value = tau, par2value = max_pos), m)
+  bind_cols(tibble(par1value = tau, par2value = ret_window), m)
 }
 
 # ── Run all combinations ───────────────────────────────────────────────────────
@@ -1846,10 +1896,10 @@ out <- purrr::map2_dfr(
 cat("Grid complete.\n")
 cat("Best Sharpe    :", round(max(out$Sharpe,    na.rm = TRUE), 3),
     "at τ =", out$par1value[which.max(out$Sharpe)],
-    "/ max_pos =", out$par2value[which.max(out$Sharpe)], "\n")
+    "/ RET_WINDOW =", out$par2value[which.max(out$Sharpe)], "days\n")
 cat("Best CumReturn :", round(max(out$CumReturn, na.rm = TRUE), 3),
     "at τ =", out$par1value[which.max(out$CumReturn)],
-    "/ max_pos =", out$par2value[which.max(out$CumReturn)], "\n")
+    "/ RET_WINDOW =", out$par2value[which.max(out$CumReturn)], "days\n")
 ```
 
 ```{r wireframe-cumreturn}
@@ -1863,7 +1913,7 @@ wireframe(
   colorkey = list(space = "right"),
   main     = "Cumulative Return",
   xlab     = "par1: Signal Threshold (τ)",
-  ylab     = "par2: Max Positions per Side",
+  ylab     = "par2: Residual Lookback (days)",
   zlab     = "CumReturn"
 )
 ```
@@ -1877,7 +1927,7 @@ out |>
   geom_raster(aes(fill = CumReturn), interpolate = TRUE) +
   scale_fill_gradient2(low = "red", mid = "white", high = "blue",
                        midpoint = median(out$CumReturn, na.rm = TRUE)) +
-  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = MAX_LONGS),
+  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = RET_WINDOW),
              shape = 3, size = 5, color = "black", stroke = 1.5) +
   scale_x_continuous(breaks = par1_grid) +
   scale_y_continuous(breaks = par2_grid) +
@@ -1891,12 +1941,12 @@ out |>
   labs(
     title    = "Optimization Results Grid — CumReturn",
     subtitle = paste0(
-      "par1 = Signal Threshold (τ)  |  par2 = Max Positions per Side\n",
+      "par1 = Signal Threshold (τ)  |  par2 = Residual Lookback (days)\n",
       "Cross = chosen parameters (τ = ", SIGNAL_THRESHOLD,
-      ", max_pos = ", MAX_LONGS, ")"
+      ", RET_WINDOW = ", RET_WINDOW, " days)"
     ),
     x    = "par1value — Signal Threshold (τ)",
-    y    = "par2value — Max Positions per Side",
+    y    = "par2value — Residual Lookback (days)",
     fill = "CumReturn"
   )
 
@@ -1907,7 +1957,7 @@ out |>
   geom_raster(aes(fill = Sharpe), interpolate = TRUE) +
   scale_fill_gradient2(low = "red", mid = "white", high = "blue",
                        midpoint = median(out$Sharpe, na.rm = TRUE)) +
-  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = MAX_LONGS),
+  geom_point(data = tibble(par1value = SIGNAL_THRESHOLD, par2value = RET_WINDOW),
              shape = 3, size = 5, color = "black", stroke = 1.5) +
   scale_x_continuous(breaks = par1_grid) +
   scale_y_continuous(breaks = par2_grid) +
@@ -1922,7 +1972,7 @@ out |>
     title    = "Optimization Results Grid — Sharpe Ratio",
     subtitle = "Smooth region = robust | Cliff-like = overfit",
     x = "par1value — Signal Threshold (τ)",
-    y = "par2value — Max Positions per Side",
+    y = "par2value — Residual Lookback (days)",
     fill = "Sharpe"
   )
 ```
@@ -1952,7 +2002,7 @@ plotly::plot_ly(
   plotly::layout(
     title = "3D Optimization Surface — CumReturn",
     scene = list(
-      xaxis = list(title = "par2: Max Positions"),
+      xaxis = list(title = "par2: Residual Lookback (days)"),
       yaxis = list(title = "par1: Signal Threshold (τ)"),
       zaxis = list(title = "CumReturn")
     )
@@ -1972,7 +2022,7 @@ wireframe(
   colorkey = list(space = "right"),
   main     = "Sharpe Ratio",
   xlab     = "par1: Signal Threshold (τ)",
-  ylab     = "par2: Max Positions per Side",
+  ylab     = "par2: Residual Lookback (days)",
   zlab     = "Sharpe"
 )
 
@@ -1984,7 +2034,7 @@ wireframe(
   colorkey = list(space = "right"),
   main     = "Cumulative Return",
   xlab     = "par1: Signal Threshold (τ)",
-  ylab     = "par2: Max Positions per Side",
+  ylab     = "par2: Residual Lookback (days)",
   zlab     = "CumReturn"
 )
 
@@ -1996,7 +2046,7 @@ wireframe(
   colorkey = list(space = "right"),
   main     = "Maximum Drawdown",
   xlab     = "par1: Signal Threshold (τ)",
-  ylab     = "par2: Max Positions per Side",
+  ylab     = "par2: Residual Lookback (days)",
   zlab     = "DD.Max"
 )
 ```
@@ -2028,7 +2078,7 @@ plotly::plot_ly(
   plotly::layout(
     title = "3D Optimization Surface — Maximum Drawdown",
     scene = list(
-      xaxis = list(title = "par2: Max Positions"),
+      xaxis = list(title = "par2: Residual Lookback (days)"),
       yaxis = list(title = "par1: Signal Threshold (τ)"),
       zaxis = list(title = "DD.Max")
     )
@@ -2086,9 +2136,9 @@ outZ |>
   ) +
   labs(
     title    = "Optimization Results Grid",
-    subtitle = "Z-score for Comparability | par1 = Signal Threshold (τ)  |  par2 = Max Positions per Side",
+    subtitle = "Z-score for Comparability | par1 = Signal Threshold (τ)  |  par2 = Residual Lookback (days)",
     x        = "par1value — Signal Threshold (τ)",
-    y        = "par2value — Max Positions per Side",
+    y        = "par2value — Residual Lookback (days)",
     fill     = "Z-score"
   )
 ```
