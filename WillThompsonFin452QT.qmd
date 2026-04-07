@@ -31,77 +31,127 @@ This project implements a **cluster-relative mean reversion** strategy on the S&
 
 ## Mental Model Diagram
 
+```{=html}
+<div style="text-align:center; margin:10px 0 6px 0;">
+  <button onclick="mzoom(1.25)"
+    style="padding:5px 14px;margin:3px;border-radius:5px;border:1px solid #94a3b8;
+           background:#f1f5f9;cursor:pointer;font-size:13px;font-weight:600;">
+    🔍 Zoom In
+  </button>
+  <button onclick="mzoom(0.8)"
+    style="padding:5px 14px;margin:3px;border-radius:5px;border:1px solid #94a3b8;
+           background:#f1f5f9;cursor:pointer;font-size:13px;font-weight:600;">
+    🔎 Zoom Out
+  </button>
+  <button onclick="mreset()"
+    style="padding:5px 14px;margin:3px;border-radius:5px;border:1px solid #94a3b8;
+           background:#f1f5f9;cursor:pointer;font-size:13px;font-weight:600;">
+    ↺ Reset
+  </button>
+  <span id="mzoom-label"
+    style="font-size:12px;color:#64748b;margin-left:10px;font-style:italic;">
+    100%
+  </span>
+</div>
+<div id="mermaid-zoom-wrap"
+  style="overflow:auto; border:2px solid #e2e8f0; border-radius:10px;
+         padding:20px; background:#ffffff; max-height:680px; cursor:grab;">
+```
+
 ```{mermaid}
 %%| fig-width: 10
 %%| fig-height: 16
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "14px", "fontFamily": "Inter, sans-serif"}}}%%
 flowchart TD
+    classDef probClass   fill:#DBEAFE,stroke:#1D4ED8,stroke-width:2px,color:#1e3a5f
+    classDef mentClass   fill:#EDE9FE,stroke:#6D28D9,stroke-width:2px,color:#3b0764
+    classDef mktClass    fill:#DCFCE7,stroke:#15803D,stroke-width:2px,color:#14532d
+    classDef inpClass    fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#78350f
+    classDef clsClass    fill:#FEE2E2,stroke:#DC2626,stroke-width:3px,color:#7f1d1d,font-weight:bold
+    classDef resClass    fill:#CCFBF1,stroke:#0D9488,stroke-width:2px,color:#134e4a
+    classDef kfClass     fill:#E0E7FF,stroke:#4338CA,stroke-width:2px,color:#1e1b4b
+    classDef decClass    fill:#FEF9C3,stroke:#CA8A04,stroke-width:2px,color:#713f12
+    classDef portClass   fill:#D1FAE5,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef valClass    fill:#F1F5F9,stroke:#475569,stroke-width:2px,color:#1e293b
+
     subgraph P["① Problem Framing"]
-        P1["Can temporary divergences among sector ETFs\nbe traded when sectors are first grouped\ninto behaviorally similar clusters?"]
-        P2["Constraints: Daily data · Monthly rebalance\nSPY + Select Sector ETFs · R / Quarto\nClustering primary · Kalman required\nCode must match mental model"]
+        P1["Can temporary divergences among sector ETFs\nbe traded when sectors are first grouped\ninto behaviorally similar clusters?"]:::probClass
+        P2["Constraints: Daily data · Monthly rebalance\nSPY + Select Sector ETFs · R / Quarto\nClustering primary · Kalman required\nCode must match mental model"]:::probClass
     end
 
     subgraph MM["② Mental Model Toolbox"]
-        M1["Systems Thinking\nETFs are interconnected,\nnot isolated assets"]
-        M2["Inversion\nWhat causes false signals\nor model failure?"]
-        M3["Margin of Safety\nOnly trade sufficiently\nlarge deviations"]
-        M4["Second-Order Thinking\nDistinguish temporary noise\nfrom structural change"]
-        M5["Risk–Reward Framework\nSignal must justify risk,\ndrawdown, and turnover"]
-        M6["Opportunity Cost\nCapital to strongest\nsignals only"]
+        M1["Systems Thinking\nETFs are interconnected,\nnot isolated assets"]:::mentClass
+        M2["Inversion\nWhat causes false signals\nor model failure?"]:::mentClass
+        M3["Margin of Safety\nOnly trade sufficiently\nlarge deviations"]:::mentClass
+        M4["Second-Order Thinking\nDistinguish temporary noise\nfrom structural change"]:::mentClass
+        M5["Risk–Reward Framework\nSignal must justify risk,\ndrawdown, and turnover"]:::mentClass
+        M6["Opportunity Cost\nCapital to strongest\nsignals only"]:::mentClass
     end
 
     subgraph MV["③ Market View / Economic Logic"]
-        MV1["Sectors form behavioral clusters\nbased on rolling return patterns"]
-        MV2["Within a cluster, one ETF can temporarily\novershoot or undershoot peers"]
-        MV3["Fair value is cluster-relative,\nnot global — apples to apples only"]
+        MV1["Sectors form behavioral clusters\nbased on rolling return patterns"]:::mktClass
+        MV2["Within a cluster, one ETF can temporarily\novershoot or undershoot peers"]:::mktClass
+        MV3["Fair value is cluster-relative,\nnot global — apples to apples only"]:::mktClass
     end
 
     subgraph DI["④ Daily Inputs"]
-        D1["Adjusted daily prices & returns"]
-        D2["Rolling 20-day & 60-day volatility"]
-        D3["Rolling 60-day correlation to SPY"]
-        D4["Rolling 60-day relative return vs SPY"]
-        D5["Rolling 60-day beta to SPY"]
+        D1["Adjusted daily prices & returns"]:::inpClass
+        D2["Rolling 20-day & 60-day volatility"]:::inpClass
+        D3["Rolling 60-day correlation to SPY"]:::inpClass
+        D4["Rolling 60-day relative return vs SPY"]:::inpClass
+        D5["Rolling 60-day beta to SPY"]:::inpClass
     end
 
-    subgraph CL["⑤ PRIMARY SIGNAL ENGINE: Clustering"]
-        C1["Elbow method → choose k clusters"]
-        C2["K-Means + Hierarchical (Ward.D2)\nAgreement = robust structure"]
-        C3["Silhouette validation\nSilhouette > 0.5 = well-clustered"]
-        C4["Fair value is cluster-relative, not global"]
+    subgraph CL["⑤ 🔑 PRIMARY SIGNAL ENGINE: Clustering"]
+        C1["Elbow method → choose k clusters"]:::clsClass
+        C2["K-Means + Hierarchical Ward.D2\nAgreement = robust structure"]:::clsClass
+        C3["Silhouette validation\nSilhouette > 0.5 = well-clustered"]:::clsClass
+        C4["Fair value is cluster-relative, not global"]:::clsClass
     end
 
     subgraph RE["⑥ Residual Construction"]
-        R1["60-day compounded return for each ETF"]
-        R2["Cluster benchmark =\nleave-one-out peer mean return"]
-        R3["Residual = ETF cum return − cluster benchmark"]
+        R1["60-day compounded return for each ETF"]:::resClass
+        R2["Cluster benchmark =\nleave-one-out peer mean return"]:::resClass
+        R3["Residual = ETF cum return − cluster benchmark"]:::resClass
     end
 
     subgraph KF["⑦ Kalman Filter — Smoothed State Estimate"]
-        K1["Local-level state-space model\napplied to each ETF's residual series"]
-        K2["Estimate latent fair-value equilibrium\nsmooth noise, improve reliability"]
-        K3["Standardized innovation = z-score signal\nKalman refines, does not replace clustering"]
+        K1["Local-level state-space model\napplied to each ETF's residual series"]:::kfClass
+        K2["Estimate latent fair-value equilibrium\nsmooth noise, improve reliability"]:::kfClass
+        K3["Standardized innovation = z-score signal\nKalman refines, does not replace clustering"]:::kfClass
     end
 
     subgraph DR["⑧ Decision Rules"]
-        DR1{"|z-score| ≥ threshold τ?"}
-        DR2["z < −τ → LONG\nETF below Kalman fair value\nExpect reversion upward"]
-        DR3["z > +τ → SHORT\nETF above Kalman fair value\nExpect reversion downward"]
-        DR4["|z| < τ → NEUTRAL\nDeviation too small\nMargin of safety not met"]
-        DR5["Rank signals by |z|\nHold only strongest N per side"]
+        DR1{"|z-score| ≥ threshold τ?"}:::decClass
+        DR2["z < −τ → LONG\nETF below Kalman fair value\nExpect reversion upward"]:::decClass
+        DR3["z > +τ → SHORT\nETF above Kalman fair value\nExpect reversion downward"]:::decClass
+        DR4["|z| < τ → NEUTRAL\nDeviation too small\nMargin of safety not met"]:::decClass
+        DR5["Rank signals by |z|\nHold only strongest N per side"]:::decClass
     end
 
     subgraph PC["⑨ Portfolio Construction"]
-        PC1["Monthly rebalance at month-end close"]
-        PC2["Equal-weight long & short positions"]
-        PC3["Signal threshold = margin of safety\nMax positions = opportunity cost filter"]
+        PC1["Monthly rebalance at month-end close"]:::portClass
+        PC2["Equal-weight long & short positions"]:::portClass
+        PC3["Signal threshold = margin of safety\nMax positions = opportunity cost filter"]:::portClass
     end
 
     subgraph VA["⑩ Validation & Iteration"]
-        V1["Training 2000–2024: parameter selection"]
-        V2["Testing 2025–2026: out-of-sample evaluation"]
-        V3["tradeStats: Sharpe, Omega, %.Win,\n%.InMrkt, DD.Max, DD.Length"]
-        V4["Bias checks: look-ahead, overfitting,\nstorytelling, structural breaks"]
+        V1["Training 2000–2024: parameter selection"]:::valClass
+        V2["Testing 2025–2026: out-of-sample evaluation"]:::valClass
+        V3["tradeStats: Sharpe, Omega, %.Win,\n%.InMrkt, DD.Max, DD.Length"]:::valClass
+        V4["Bias checks: look-ahead, overfitting,\nstorytelling, structural breaks"]:::valClass
     end
+
+    style P  fill:#EFF6FF,stroke:#1D4ED8,stroke-width:2px
+    style MM fill:#F5F3FF,stroke:#6D28D9,stroke-width:2px
+    style MV fill:#F0FDF4,stroke:#15803D,stroke-width:2px
+    style DI fill:#FFFBEB,stroke:#D97706,stroke-width:2px
+    style CL fill:#FFF1F2,stroke:#DC2626,stroke-width:3px
+    style RE fill:#F0FDFA,stroke:#0D9488,stroke-width:2px
+    style KF fill:#EEF2FF,stroke:#4338CA,stroke-width:2px
+    style DR fill:#FEFCE8,stroke:#CA8A04,stroke-width:2px
+    style PC fill:#ECFDF5,stroke:#059669,stroke-width:2px
+    style VA fill:#F8FAFC,stroke:#475569,stroke-width:2px
 
     P --> MM --> MV --> DI --> CL --> RE --> KF --> DR
     DR --> DR1
@@ -110,6 +160,40 @@ flowchart TD
     DR1 --> DR4
     DR2 & DR3 --> DR5 --> PC --> VA
     VA -->|"Reflect & refine parameters"| CL
+```
+
+```{=html}
+</div>
+<script>
+(function () {
+  var scale = 1;
+  function getSvg() {
+    return document.querySelector('#mermaid-zoom-wrap svg');
+  }
+  function applyScale() {
+    var svg = getSvg();
+    if (!svg) return;
+    svg.style.transform       = 'scale(' + scale + ')';
+    svg.style.transformOrigin = 'top left';
+    svg.style.display         = 'block';
+    var lbl = document.getElementById('mzoom-label');
+    if (lbl) lbl.textContent = Math.round(scale * 100) + '%';
+  }
+  window.mzoom = function (f) {
+    scale = Math.max(0.2, Math.min(scale * f, 5));
+    applyScale();
+  };
+  window.mreset = function () {
+    scale = 1;
+    applyScale();
+  };
+  /* Poll until mermaid has rendered the SVG (client-side rendering) */
+  var tries = 0;
+  var timer = setInterval(function () {
+    if (getSvg() || ++tries > 60) { clearInterval(timer); applyScale(); }
+  }, 100);
+})();
+</script>
 ```
 
 ---
