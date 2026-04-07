@@ -48,9 +48,6 @@ library(factoextra)   # fviz_dend(), fviz_silhouette()
 # ── Performance analytics ──────────────────────────────────────────────────────
 library(PerformanceAnalytics)   # SharpeRatio, Omega, chart.Drawdown, table.Drawdowns
 
-# ── Parallel optimization (professor's foreach %dopar% pattern) ────────────────
-library(foreach)
-library(doParallel)
 
 # ── Visualization ──────────────────────────────────────────────────────────────
 library(patchwork)
@@ -1907,27 +1904,14 @@ eval_params <- function(tau, ret_window) {
   bind_cols(tibble(par1value = tau, par2value = ret_window), m)
 }
 
-# ── Run all combinations in parallel (professor's foreach %dopar% pattern) ─────
-library(foreach)
-library(doParallel)
-
-n_cores <- max(1L, parallel::detectCores() - 1L)
-cl <- makeCluster(n_cores)
-registerDoParallel(cl)
-
-res_list <- foreach(
-  i        = 1:nrow(out),
-  .combine = "rbind",
-  .packages = c("dplyr", "tidyr", "purrr")
-) %dopar% {
-  as.data.frame(
-    eval_params(out[i, "par1value"], out[i, "par2value"])
-  )
-}
-
-stopCluster(cl)
-
-out <- dplyr::as_tibble(res_list)
+# ── Run all 207 combinations ───────────────────────────────────────────────────
+# kf_cache pre-computation reduces per-call cost to cheap signal/position/return
+# aggregation only, so sequential purrr::map2_dfr completes in well under 1 min.
+out <- purrr::map2_dfr(
+  out$par1value,
+  out$par2value,
+  eval_params
+)
 
 cat("Grid complete.\n")
 cat("Best Sharpe    :", round(max(out$Sharpe,    na.rm = TRUE), 3),
