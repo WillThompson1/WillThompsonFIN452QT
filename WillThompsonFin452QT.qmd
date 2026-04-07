@@ -618,6 +618,7 @@ The diagram below captures the complete decision logic, from problem framing thr
 
 
 
+:::{.mermaid-container}
 ```{mermaid}
 %%| fig-width: 10
 %%| fig-height: 16
@@ -722,13 +723,14 @@ flowchart TD
     VA -->|"Reflect & refine parameters"| CL
 ```
 
+:::
+
 ```{=html}
-</div>
 <script>
 (function () {
   var scale = 1;
   function getSvg() {
-    return document.querySelector('#mermaid-zoom-wrap svg');
+    return document.querySelector('.mermaid-container svg');
   }
   function applyScale() {
     var svg = getSvg();
