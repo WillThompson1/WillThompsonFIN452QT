@@ -616,40 +616,7 @@ By grouping sectors into behavioral clusters first — and then measuring each E
 
 The diagram below captures the complete decision logic, from problem framing through signal generation to out-of-sample validation. Every component in the R implementation traces back to a specific node in this model. Clustering defines comparability. The Kalman filter refines it. The z-score triggers it. The decision rules execute it.
 
-```{=html}
-<style>
-.mermaid-container {
-  overflow: auto;
-  border: 2px solid #e2e8f0;
-  border-radius: 10px;
-  padding: 20px;
-  background: #ffffff;
-  max-height: 680px;
-  cursor: grab;
-}
-</style>
-<div style="text-align:center; margin:10px 0 6px 0;">
-  <button onclick="mzoom(1.25)"
-    style="padding:5px 14px;margin:3px;border-radius:5px;border:1px solid #94a3b8;
-           background:#f1f5f9;cursor:pointer;font-size:13px;font-weight:600;">
-    🔍 Zoom In
-  </button>
-  <button onclick="mzoom(0.8)"
-    style="padding:5px 14px;margin:3px;border-radius:5px;border:1px solid #94a3b8;
-           background:#f1f5f9;cursor:pointer;font-size:13px;font-weight:600;">
-    🔎 Zoom Out
-  </button>
-  <button onclick="mreset()"
-    style="padding:5px 14px;margin:3px;border-radius:5px;border:1px solid #94a3b8;
-           background:#f1f5f9;cursor:pointer;font-size:13px;font-weight:600;">
-    ↺ Reset
-  </button>
-  <span id="mzoom-label"
-    style="font-size:12px;color:#64748b;margin-left:10px;font-style:italic;">
-    100%
-  </span>
-</div>
-```
+
 
 :::{.mermaid-container}
 ```{mermaid}
@@ -668,27 +635,27 @@ flowchart TD
     classDef portClass   fill:#D1FAE5,stroke:#059669,stroke-width:2px,color:#064e3b
     classDef valClass    fill:#F1F5F9,stroke:#475569,stroke-width:2px,color:#1e293b
 
-    subgraph P["① Problem Framing"]
-        P1["Can temporary divergences among sector ETFs\nbe traded when sectors are first grouped\ninto behaviorally similar clusters?"]:::probClass
-        P2["Constraints: Daily data · Monthly rebalance\nSPY + Select Sector ETFs · R / Quarto\nClustering primary · Kalman required\nCode must match mental model"]:::probClass
+    subgraph P["Problem Framing"]
+        P1["Can temporary divergences among sector ETFs<br>be traded when sectors are first grouped<br>into behaviorally similar clusters?"]:::probClass
+        P2["Constraints: Daily data · Monthly rebalance<br>SPY + Select Sector ETFs · R / Quarto<br>Clustering primary · Kalman required<br>Code must match mental model"]:::probClass
     end
 
-    subgraph MM["② Mental Model Toolbox"]
-        M1["Systems Thinking\nETFs are interconnected,\nnot isolated assets"]:::mentClass
-        M2["Inversion\nWhat causes false signals\nor model failure?"]:::mentClass
-        M3["Margin of Safety\nOnly trade sufficiently\nlarge deviations"]:::mentClass
-        M4["Second-Order Thinking\nDistinguish temporary noise\nfrom structural change"]:::mentClass
-        M5["Risk–Reward Framework\nSignal must justify risk,\ndrawdown, and turnover"]:::mentClass
-        M6["Opportunity Cost\nCapital to strongest\nsignals only"]:::mentClass
+    subgraph MM["Mental Model Toolbox"]
+        M1["Systems Thinking<br>ETFs are interconnected,<br>not isolated assets"]:::mentClass
+        M2["Inversion<br>What causes false signals<br>or model failure?"]:::mentClass
+        M3["Margin of Safety<br>Only trade sufficiently<br>large deviations"]:::mentClass
+        M4["Second-Order Thinking<br>Distinguish temporary noise<br>from structural change"]:::mentClass
+        M5["Risk–Reward Framework<br>Signal must justify risk,<br>drawdown, and turnover"]:::mentClass
+        M6["Opportunity Cost<br>Capital to strongest<br>signals only"]:::mentClass
     end
 
-    subgraph MV["③ Market View / Economic Logic"]
-        MV1["Sectors form behavioral clusters\nbased on rolling return patterns"]:::mktClass
-        MV2["Within a cluster, one ETF can temporarily\novershoot or undershoot peers"]:::mktClass
-        MV3["Fair value is cluster-relative,\nnot global — apples to apples only"]:::mktClass
+    subgraph MV["Market View / Economic Logic"]
+        MV1["Sectors form behavioral clusters<br>based on rolling return patterns"]:::mktClass
+        MV2["Within a cluster, one ETF can temporarily<br>overshoot or undershoot peers"]:::mktClass
+        MV3["Fair value is cluster-relative,<br>not global — apples to apples only"]:::mktClass
     end
 
-    subgraph DI["④ Daily Inputs"]
+    subgraph DI["Daily Inputs"]
         D1["Adjusted daily prices & returns"]:::inpClass
         D2["Rolling 20-day & 60-day volatility"]:::inpClass
         D3["Rolling 60-day correlation to SPY"]:::inpClass
@@ -696,44 +663,44 @@ flowchart TD
         D5["Rolling 60-day beta to SPY"]:::inpClass
     end
 
-    subgraph CL["⑤ 🔑 PRIMARY SIGNAL ENGINE: Clustering"]
+    subgraph CL["PRIMARY SIGNAL ENGINE: Clustering"]
         C1["Elbow method → choose k clusters"]:::clsClass
-        C2["K-Means + Hierarchical Ward.D2\nAgreement = robust structure"]:::clsClass
-        C3["Silhouette validation\nSilhouette > 0.5 = well-clustered"]:::clsClass
+        C2["K-Means + Hierarchical Ward.D2<br>Agreement = robust structure"]:::clsClass
+        C3["Silhouette validation<br>Silhouette > 0.5 = well-clustered"]:::clsClass
         C4["Fair value is cluster-relative, not global"]:::clsClass
     end
 
-    subgraph RE["⑥ Residual Construction"]
+    subgraph RE["Residual Construction"]
         R1["60-day compounded return for each ETF"]:::resClass
-        R2["Cluster benchmark =\nleave-one-out peer mean return"]:::resClass
+        R2["Cluster benchmark =<br>leave-one-out peer mean return"]:::resClass
         R3["Residual = ETF cum return − cluster benchmark"]:::resClass
     end
 
-    subgraph KF["⑦ Kalman Filter — Smoothed State Estimate"]
-        K1["Local-level state-space model\napplied to each ETF's residual series"]:::kfClass
-        K2["Estimate latent fair-value equilibrium\nsmooth noise, improve reliability"]:::kfClass
-        K3["Standardized innovation = z-score signal\nKalman refines, does not replace clustering"]:::kfClass
+    subgraph KF["Kalman Filter — Smoothed State Estimate"]
+        K1["Local-level state-space model<br>applied to each ETF's residual series"]:::kfClass
+        K2["Estimate latent fair-value equilibrium<br>smooth noise, improve reliability"]:::kfClass
+        K3["Standardized innovation = z-score signal<br>Kalman refines, does not replace clustering"]:::kfClass
     end
 
-    subgraph DR["⑧ Decision Rules"]
+    subgraph DR["Decision Rules"]
         DR1{"|z-score| ≥ threshold τ?"}:::decClass
-        DR2["z < −τ → LONG\nETF below Kalman fair value\nExpect reversion upward"]:::decClass
-        DR3["z > +τ → SHORT\nETF above Kalman fair value\nExpect reversion downward"]:::decClass
-        DR4["|z| < τ → NEUTRAL\nDeviation too small\nMargin of safety not met"]:::decClass
-        DR5["Rank signals by |z|\nHold only strongest N per side"]:::decClass
+        DR2["z < −τ → LONG<br>ETF below Kalman fair value<br>Expect reversion upward"]:::decClass
+        DR3["z > +τ → SHORT<br>ETF above Kalman fair value<br>Expect reversion downward"]:::decClass
+        DR4["|z| < τ → NEUTRAL<br>Deviation too small<br>Margin of safety not met"]:::decClass
+        DR5["Rank signals by |z|<br>Hold only strongest N per side"]:::decClass
     end
 
-    subgraph PC["⑨ Portfolio Construction"]
+    subgraph PC["Portfolio Construction"]
         PC1["Monthly rebalance at month-end close"]:::portClass
         PC2["Equal-weight long & short positions"]:::portClass
-        PC3["Signal threshold = margin of safety\nMax positions = opportunity cost filter"]:::portClass
+        PC3["Signal threshold = margin of safety<br>Max positions = opportunity cost filter"]:::portClass
     end
 
-    subgraph VA["⑩ Validation & Iteration"]
+    subgraph VA["Validation & Iteration"]
         V1["Training 2000–2024: parameter selection"]:::valClass
         V2["Testing 2025–2026: out-of-sample evaluation"]:::valClass
-        V3["tradeStats: Sharpe, Omega, %.Win,\n%.InMrkt, DD.Max, DD.Length"]:::valClass
-        V4["Bias checks: look-ahead, overfitting,\nstorytelling, structural breaks"]:::valClass
+        V3["tradeStats: Sharpe, Omega, %.Win,<br>%.InMrkt, DD.Max, DD.Length"]:::valClass
+        V4["Bias checks: look-ahead, overfitting,<br>storytelling, structural breaks"]:::valClass
     end
 
     style P  fill:#EFF6FF,stroke:#1D4ED8,stroke-width:2px
