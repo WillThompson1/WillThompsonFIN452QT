@@ -48,6 +48,10 @@ library(factoextra)   # fviz_dend(), fviz_silhouette()
 # ── Performance analytics ──────────────────────────────────────────────────────
 library(PerformanceAnalytics)   # SharpeRatio, Omega, chart.Drawdown, table.Drawdowns
 
+# ── Parallel optimization (professor's foreach %dopar% pattern) ────────────────
+library(foreach)
+library(doParallel)
+
 # ── Visualization ──────────────────────────────────────────────────────────────
 library(patchwork)
 library(scales)
@@ -236,7 +240,8 @@ roll_beta <- function(x, y, n) {
 roll_cum_ret <- function(x, n) {
   # slide_sum over log-returns + expm1 uses slider's fast C loop
   # mathematically identical to prod(1+r_i)-1 up to float rounding
-  expm1(slider::slide_sum(log1p(x), before = n - 1L, complete = TRUE))
+  # NOTE: slider args require the dot prefix (.before, .complete)
+  expm1(slider::slide_sum(log1p(x), .before = n - 1L, .complete = TRUE))
 }
 
 # ── Compute features for all sector ETFs ──────────────────────────────────────
@@ -1792,26 +1797,24 @@ sensitivity_tau |>
 par1_grid <- seq(0.25, 2.50, by = 0.10)   # τ  (23 values: 0.25 … 2.50)
 par2_grid <- seq(20,  100,   by = 10)      # RET_WINDOW days  (9 values: 20 … 100)
 
-grid_params <- expand_grid(
-  par1value = par1_grid,   # tau
-  par2value = par2_grid    # ret_window
+out <- expand.grid(
+  par1value = par1_grid,
+  par2value = par2_grid
 )
 
-cat("Running 2-parameter grid:", nrow(grid_params), "combinations",
-    "(", length(par1_grid), "× τ  ×", length(par2_grid), "× RET_WINDOW)...\n")
+cat("Running 2-parameter grid:", nrow(out), "combinations",
+    "(", length(par1_grid), "τ ×", length(par2_grid), "RET_WINDOW)...\n")
 
 # ── Pre-compute Kalman z-scores for each unique ret_window (9 runs, not 207) ──
-# The expensive work (slider → residuals → Kalman) depends only on ret_window,
-# NOT on τ.  Pre-computing once per window and caching in a named list means
-# eval_params only does cheap signal/position/return aggregation per τ.
+# Expensive work (rolling return → residuals → Kalman) depends only on
+# ret_window, not τ.  Cache once per window; eval_params then does only
+# cheap signal / position / return aggregation.
 
 sector_daily_base <- returns_daily |>
   filter(symbol %in% SECTOR_TICKERS) |>
   arrange(symbol, date) |>
-  # Pre-compute log(1+r) once; slide_sum() over log-rets is a fast C loop
-  # vs slide_dbl(~prod(...)) which calls an R closure ~66k times per window
   mutate(log_ret = log1p(retClCl)) |>
-  select(symbol, date, retClCl, log_ret)
+  select(symbol, date, log_ret)
 
 cluster_daily_slim <- cluster_daily |> select(symbol, date, cluster)
 
@@ -1822,10 +1825,11 @@ kf_cache <- purrr::map(
 
     # Step 1 — rolling cumulative return via log-return sum (fast C path)
     # exp(sum(log(1+r_i))) - 1  ≡  prod(1+r_i) - 1  (exact up to float rounding)
+    # IMPORTANT: slider named args require the dot-prefix (.before, .complete)
     cum_ret_w <- sector_daily_base |>
       group_by(symbol) |>
       mutate(
-        cum_ret = expm1(slider::slide_sum(log_ret, before = n - 1L, complete = TRUE))
+        cum_ret = expm1(slider::slide_sum(log_ret, .before = n - 1L, .complete = TRUE))
       ) |>
       ungroup() |>
       select(symbol, date, cum_ret)
@@ -1860,7 +1864,11 @@ kf_cache <- purrr::map(
 
 cat("Pre-computed Kalman z-scores for", length(kf_cache), "lookback windows.\n")
 
-# ── Evaluation function — only signal/position/return work per (τ, ret_window) ─
+# ── Strategy function (signal/position/return only — fast per call) ────────────
+# Mirrors professor's pattern: strategy as a function, grid iterated in parallel.
+# Professor uses RTL::tradeStrategySMA (single-ticker SMA, ms per call).
+# Our multi-ETF cluster strategy is heavier, hence the kf_cache pre-computation
+# above reduces the per-call cost to the same cheap aggregation pattern.
 eval_params <- function(tau, ret_window) {
   kf_monthly <- kf_cache[[as.character(ret_window)]]
 
@@ -1899,12 +1907,27 @@ eval_params <- function(tau, ret_window) {
   bind_cols(tibble(par1value = tau, par2value = ret_window), m)
 }
 
-# ── Run all 207 combinations (fast: just signal/position/return per row) ───────
-out <- purrr::map2_dfr(
-  grid_params$par1value,
-  grid_params$par2value,
-  eval_params
-)
+# ── Run all combinations in parallel (professor's foreach %dopar% pattern) ─────
+library(foreach)
+library(doParallel)
+
+n_cores <- max(1L, parallel::detectCores() - 1L)
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+res_list <- foreach(
+  i        = 1:nrow(out),
+  .combine = "rbind",
+  .packages = c("dplyr", "tidyr", "purrr")
+) %dopar% {
+  as.data.frame(
+    eval_params(out[i, "par1value"], out[i, "par2value"])
+  )
+}
+
+stopCluster(cl)
+
+out <- dplyr::as_tibble(res_list)
 
 cat("Grid complete.\n")
 cat("Best Sharpe    :", round(max(out$Sharpe,    na.rm = TRUE), 3),
