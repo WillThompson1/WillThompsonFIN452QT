@@ -314,8 +314,6 @@ features_daily |>
 
 Each panel shows one feature pooled across all ETFs and all 24 training years. Beta peaks near 1.0, confirming sector ETFs are highly correlated to the broad market. Correlation is similarly concentrated near 0.8. The volatility panels have right-skewed tails driven by 2008 and 2020 crisis spikes. Relative return is centered tightly near zero, which is exactly what you need for a mean-reversion strategy: the deviations exist, but they do not persist forever.
 
-## Cluster Selection: Elbow and Silhouette
-
 ```{r month-ends}
 #| include: false
 #| echo: false
@@ -863,6 +861,8 @@ if (na_standard > 0) {
 ## Feature Engineering
 
 Five rolling behavioral features are computed daily for each sector ETF: 20-day annualized volatility, 60-day annualized volatility, 60-day SPY correlation, 60-day SPY beta, and 60-day relative return versus SPY. These five features capture how each sector moves, how volatile it is, and how it relates to the broad market. All features are standardized before clustering so no single variable dominates by scale.
+
+## Cluster Selection: Elbow and Silhouette
 
 ```{r elbow-method}
 # Compute within-cluster sum of squares for k = 1 to 6 on a representative snapshot
