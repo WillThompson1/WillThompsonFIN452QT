@@ -1840,10 +1840,20 @@ eval_params <- function(tau, kf_q) {
       TRUE        ~ "NEUTRAL"
     ))
 
-  pos <- sigs |>
+  # Vectorized position building — replaces group_modify(~build_positions(.x))
+  # slice_min/max uses dplyr's C++ backend, not an R closure per group.
+  # Identical result: top-N by |kf_z|, equal weights, correct signs.
+  longs  <- sigs |> filter(signal == "LONG") |>
     group_by(date) |>
-    group_modify(~ build_positions(.x)) |>
-    ungroup()
+    slice_min(kf_z, n = MAX_LONGS,  with_ties = FALSE) |>
+    mutate(weight =  1 / n()) |> ungroup()
+
+  shorts <- sigs |> filter(signal == "SHORT") |>
+    group_by(date) |>
+    slice_max(kf_z, n = MAX_SHORTS, with_ties = FALSE) |>
+    mutate(weight = -1 / n()) |> ungroup()
+
+  pos <- bind_rows(longs, shorts)
 
   strat_ret <- pos |>
     rename(signal_date = date) |>
