@@ -1792,8 +1792,8 @@ sensitivity_tau |>
 #       Low Q  → slow-adapting, smoother state, fewer signal flips (like long MA)
 #       High Q → fast-adapting, reactive state, more signal flips (like short MA)
 #       Directly analogous to the professor's short-MA vs long-MA parameter pair.
-par1_grid <- seq(0.10, 3.00, by = 0.10)                         # τ  — 29 values
-par2_grid <- round(seq(0.00005, 0.01, length.out = 12), 6)     # Q  — 12 values
+par1_grid <- seq(0.05, 3.00, by = 0.05)                         # τ  — 59 values
+par2_grid <- round(seq(0.00005, 0.01, length.out = 15), 6)     # Q  — 15 values
 
 out <- expand.grid(
   par1value = par1_grid,
