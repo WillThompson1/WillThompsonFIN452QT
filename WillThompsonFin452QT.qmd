@@ -943,10 +943,12 @@ p_sil_km <- p_sil_km +
 p_sil_hc / p_sil_km
 
 # Agreement check — use cluster_history (same source as the comparison table)
-# Remap K-Means labels to best match Hierarchical via contingency table.
+# apply(ct,2,which.max) returns the ROW POSITION of the max, not the row label.
+# Explicitly map position → row name to get the correct HC label for each KM label.
 snap_agr      <- cluster_history |> filter(date == last_train_date)
 ct            <- table(hclust = snap_agr$cluster, kmeans = snap_agr$cluster_kmeans)
-remap         <- apply(ct, 2, which.max)   # for each KM label → HC label it most overlaps with
+best_pos      <- apply(ct, 2, which.max)          # position of max HC label per KM column
+remap         <- setNames(as.integer(rownames(ct)[best_pos]), colnames(ct))
 km_remapped   <- remap[as.character(snap_agr$cluster_kmeans)]
 agreement_pct <- mean(snap_agr$cluster == km_remapped) * 100
 ```
