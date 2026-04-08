@@ -813,8 +813,6 @@ All prices are downloaded from Yahoo Finance via `tidyquant::tq_get()` using adj
 missing_tickers <- setdiff(TICKERS, unique(raw_prices$symbol))
 if (length(missing_tickers) > 0) {
   stop("Missing tickers: ", paste(missing_tickers, collapse = ", "))
-} else {
-  cat("CHECK 1 PASS: All", length(TICKERS), "tickers downloaded.\n")
 }
 
 # ── Check 2: Date coverage and NA rates ───────────────────────────────────────
@@ -850,8 +848,6 @@ na_standard <- raw_prices |>
 
 if (na_standard > 0) {
   warning("NA values found in adjusted prices for standard tickers in training period!")
-} else {
-  cat("CHECK 3 PASS: No NA in adjusted prices for standard tickers (training period).\n")
 }
 ```
 
@@ -931,23 +927,23 @@ set.seed(42L)
 km_sil  <- stats::kmeans(scaled_sil, centers = N_CLUSTERS, nstart = 25L)
 sil_km  <- cluster::silhouette(km_sil$cluster, dist_sil)
 
-p_sil_hc <- factoextra::fviz_silhouette(sil_hc) +
+invisible(capture.output(p_sil_hc <- factoextra::fviz_silhouette(sil_hc)))
+p_sil_hc <- p_sil_hc +
   labs(title = paste("Silhouette — Hierarchical (k =", N_CLUSTERS, ")"),
        subtitle = paste("Avg width:", round(mean(sil_hc[, "sil_width"]), 3),
                         "| >0.5 = well-clustered | <0.3 = weak")) +
   theme_minimal(base_size = 10)
 
-p_sil_km <- factoextra::fviz_silhouette(sil_km) +
+invisible(capture.output(p_sil_km <- factoextra::fviz_silhouette(sil_km)))
+p_sil_km <- p_sil_km +
   labs(title = paste("Silhouette — K-Means (k =", N_CLUSTERS, ")"),
        subtitle = paste("Avg width:", round(mean(sil_km[, "sil_width"]), 3))) +
   theme_minimal(base_size = 10)
 
 p_sil_hc / p_sil_km
 
-# Agreement check — do both methods agree?
+# Agreement check — do both methods agree? (used in prose below)
 agreement_pct <- mean(cuts_hc == km_sil$cluster) * 100
-cat("\nCluster method agreement:", round(agreement_pct, 1), "%\n")
-cat("Interpretation: Agreement >= 70% suggests robust structure.\n")
 ```
 
 Both hierarchical and K-Means silhouette plots show average widths of 0.407 at k=3. For a universe of only 11 ETFs, a score above 0.4 indicates solid separation. ETF 5 (Utilities) shows near-zero width in the hierarchical solution, which is expected: XLU sits at the behavioral boundary between defensive and cyclical clusters and can move either way depending on rates. Crucially, both methods agree on the same assignments, confirming that k=3 reflects genuine structure rather than a quirk of one algorithm.
@@ -1256,9 +1252,17 @@ pos_summary <- positions_all |>
             gross   = sum(abs(weight)),
             net     = sum(weight), .groups = "drop")
 
-cat("Avg longs per month  :", round(mean(pos_summary$n_long), 1), "\n")
-cat("Avg shorts per month :", round(mean(pos_summary$n_short), 1), "\n")
-cat("Months with no positions :", sum(pos_summary$gross == 0), "\n")
+tibble(
+  Metric = c("Avg long positions per month", "Avg short positions per month",
+             "Months with no positions", "Total rebalance dates"),
+  Value  = c(round(mean(pos_summary$n_long), 1),
+             round(mean(pos_summary$n_short), 1),
+             sum(pos_summary$gross == 0),
+             nrow(pos_summary))
+) |>
+  gt() |>
+  tab_header(title = "Portfolio Activity Summary") |>
+  cols_label(Metric = "Metric", Value = "Value")
 
 # Gross/net exposure chart
 pos_summary |>
@@ -1417,8 +1421,6 @@ backtest_df <- strategy_returns |>
   filter(!is.na(spy_ret)) |>
   mutate(period = if_else(return_date <= TRAIN_END, "Training", "Testing"))
 
-cat("Training months:", sum(backtest_df$period == "Training"), "\n")
-cat("Testing  months:", sum(backtest_df$period == "Testing"), "\n")
 ```
 
 # Portfolio and Backtest Results
@@ -1594,8 +1596,15 @@ PerformanceAnalytics::chart.Drawdown(
 )
 
 # Top drawdowns table (class notes style: table.Drawdowns)
-cat("\n--- Top 10 Strategy Drawdowns ---\n")
-PerformanceAnalytics::table.Drawdowns(strat_xts, top = 10)
+PerformanceAnalytics::table.Drawdowns(strat_xts, top = 10) |>
+  as_tibble() |>
+  mutate(across(where(is.numeric) & !c(Length, `To Trough`, Recovery),
+                ~ scales::percent(., accuracy = 0.1))) |>
+  gt() |>
+  tab_header(title = "Top 10 Strategy Drawdowns") |>
+  cols_label(From = "Start", Trough = "Trough", To = "Recovery End",
+             Depth = "Depth", Length = "Length (mo)",
+             `To Trough` = "To Trough (mo)", Recovery = "Recovery (mo)")
 ```
 
 The drawdown chart (blue = strategy, orange = SPY) shows the strategy avoids the worst equity drawdowns. SPY dropped nearly 50% in 2009; the strategy's worst drawdown over the same period was much shallower. The strategy's worst periods occur around 2020, where the COVID shock briefly caused correlated moves across all sectors that broke the mean-reversion assumption. The flat-to-zero stretches between drawdowns are months where the strategy was simply neutral.
@@ -2252,10 +2261,19 @@ turnover_summary <- turnover_df |>
     annual_turnover_est     = mean(turnover, na.rm = TRUE) * 12
   )
 
-cat("=== Turnover Analysis ===\n")
-cat("Avg monthly one-way turnover  :", percent(turnover_summary$avg_monthly_turnover, 0.1), "\n")
-cat("Median monthly one-way turnover:", percent(turnover_summary$median_monthly_turnover, 0.1), "\n")
-cat("Est. annual one-way turnover  :", percent(turnover_summary$annual_turnover_est, 0.1), "\n")
+turnover_summary |>
+  pivot_longer(everything(), names_to = "Metric", values_to = "Value") |>
+  mutate(
+    Metric = recode(Metric,
+      avg_monthly_turnover    = "Avg Monthly One-Way Turnover",
+      median_monthly_turnover = "Median Monthly One-Way Turnover",
+      max_monthly_turnover    = "Max Monthly One-Way Turnover",
+      annual_turnover_est     = "Est. Annual One-Way Turnover"),
+    Value = scales::percent(Value, accuracy = 0.1)
+  ) |>
+  gt() |>
+  tab_header(title = "Turnover Summary") |>
+  cols_label(Metric = "Metric", Value = "Value")
 
 # ── Estimate performance drag at different cost assumptions ────────────────────
 cost_bps <- c(5, 10, 20, 30)   # Round-trip transaction cost in basis points
@@ -2398,18 +2416,36 @@ residuals_daily |>
 
 ```{r pa-metrics}
 # PerformanceAnalytics versions (matching class notes)
-cat("=== Strategy - Training Period ===\n")
 train_xts <- strat_xts[index(strat_xts) <= TRAIN_END]
+test_xts  <- strat_xts[index(strat_xts) >= TEST_START]
 
-cat("Sharpe Ratio:\n")
-print(PerformanceAnalytics::SharpeRatio(train_xts))
+# Sharpe ratios — bind training and testing side by side
+sr_train <- as.data.frame(PerformanceAnalytics::SharpeRatio(train_xts))
+sr_test  <- as.data.frame(PerformanceAnalytics::SharpeRatio(test_xts))
 
-cat("\nOmega Sharpe Ratio (MAR = 0):\n")
-print(PerformanceAnalytics::OmegaSharpeRatio(train_xts, MAR = 0))
+sr_train |>
+  rownames_to_column("Metric") |>
+  rename(Training = 2) |>
+  left_join(sr_test |> rownames_to_column("Metric") |> rename(Testing = 2),
+            by = "Metric") |>
+  gt() |>
+  tab_header(title = "Sharpe Ratios — PerformanceAnalytics",
+             subtitle = "Training: 2000–2024 | Testing: Jan 2025–Mar 2026") |>
+  fmt_number(columns = c(Training, Testing), decimals = 3) |>
+  cols_label(Metric = "Metric", Training = "Training", Testing = "Testing")
 
-cat("\n=== Strategy - Testing Period ===\n")
-test_xts <- strat_xts[index(strat_xts) >= TEST_START]
-print(PerformanceAnalytics::SharpeRatio(test_xts))
+# Omega Sharpe Ratio
+tibble(
+  Period      = c("Training (2000–2024)", "Testing (Jan 2025–Mar 2026)"),
+  OmegaSharpe = c(
+    as.numeric(PerformanceAnalytics::OmegaSharpeRatio(train_xts, MAR = 0)),
+    as.numeric(PerformanceAnalytics::OmegaSharpeRatio(test_xts,  MAR = 0))
+  )
+) |>
+  gt() |>
+  tab_header(title = "Omega Sharpe Ratio (MAR = 0)") |>
+  fmt_number(columns = OmegaSharpe, decimals = 3) |>
+  cols_label(Period = "Period", OmegaSharpe = "Omega Sharpe")
 ```
 
 ```{r risk-appetite}
@@ -2429,10 +2465,6 @@ sensitivity_tau |>
 ```
 
 ```{r trade-analysis}
-# Turnover
-cat("Avg monthly one-way turnover:",
-    percent(mean(turnover_df$turnover, na.rm = TRUE), accuracy = 0.1), "\n")
-
 # Win/loss by signal direction
 position_returns_detail <- positions_all |>
   rename(signal_date = date) |>
