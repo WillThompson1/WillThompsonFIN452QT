@@ -946,8 +946,8 @@ p_sil_hc / p_sil_km
 # Cluster labels (1/2/3) are arbitrary and can differ between methods.
 # Remap K-Means labels to best match Hierarchical via contingency table.
 ct      <- table(hclust = cuts_hc, kmeans = km_sil$cluster)
-remap   <- apply(ct, 1, which.max)           # for each HC label, find best-matching KM label
-km_remapped  <- remap[as.character(km_sil$cluster)]
+remap   <- apply(ct, 2, which.max)   # for each KM label, find the HC label it most overlaps with
+km_remapped   <- remap[as.character(km_sil$cluster)]
 agreement_pct <- mean(cuts_hc == km_remapped) * 100
 ```
 
