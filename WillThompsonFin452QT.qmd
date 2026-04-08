@@ -1173,7 +1173,7 @@ kalman_results |>
 
 The top panel shows the Kalman filtered state (blue) overlaid on the observed residual (grey) for four ETFs. The filter lags the sharpest spikes and smooths month-to-month noise, producing a more reliable estimate of where the residual "should" be right now. XLE shows the most dramatic deviations -- the 2020 energy crash is visible as a sharp downward spike. The bottom histogram shows that Kalman standardized innovations are much narrower than the N(0,1) reference (red curve). Most months produce no extreme signal, which is exactly what the margin-of-safety design intends. The orange dashed lines at plus and minus 1 mark the threshold. Only the bars beyond those lines trigger trades.
 
-# Portfolio and Backtest Results
+# Portfolio Construction
 
 At each month-end, signals are ranked by z-score magnitude. Long positions are equal-weighted within the long book and short positions equal-weighted within the short book. The strategy holds at most 3 long and 3 short positions per rebalance. Months with no qualifying signals produce zero returns: idle capital is preferable to weak, underpowered trades.
 
