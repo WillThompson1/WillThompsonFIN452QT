@@ -942,13 +942,13 @@ p_sil_km <- p_sil_km +
 
 p_sil_hc / p_sil_km
 
-# Agreement check — label-permutation-aware
-# Cluster labels (1/2/3) are arbitrary and can differ between methods.
+# Agreement check — use cluster_history (same source as the comparison table)
 # Remap K-Means labels to best match Hierarchical via contingency table.
-ct      <- table(hclust = cuts_hc, kmeans = km_sil$cluster)
-remap   <- apply(ct, 2, which.max)   # for each KM label, find the HC label it most overlaps with
-km_remapped   <- remap[as.character(km_sil$cluster)]
-agreement_pct <- mean(cuts_hc == km_remapped) * 100
+snap_agr      <- cluster_history |> filter(date == last_train_date)
+ct            <- table(hclust = snap_agr$cluster, kmeans = snap_agr$cluster_kmeans)
+remap         <- apply(ct, 2, which.max)   # for each KM label → HC label it most overlaps with
+km_remapped   <- remap[as.character(snap_agr$cluster_kmeans)]
+agreement_pct <- mean(snap_agr$cluster == km_remapped) * 100
 ```
 
 Both hierarchical and K-Means silhouette plots show average widths of 0.407 at k=3. For a universe of only 11 ETFs, a score above 0.4 indicates solid separation. XLU (Utilities) shows near-zero width in the hierarchical solution — expected, as it sits at the behavioral boundary between defensive and cyclical clusters. Both methods agree on the same underlying groupings once cluster labels are aligned (see table below). Clustering algorithms assign label numbers arbitrarily, so "Cluster 1" in one method may be called "Cluster 2" in another. After remapping, agreement is `r round(agreement_pct, 1)`%.
