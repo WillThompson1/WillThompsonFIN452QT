@@ -942,28 +942,48 @@ p_sil_km <- p_sil_km +
 
 p_sil_hc / p_sil_km
 
-# Agreement check — do both methods agree? (used in prose below)
-agreement_pct <- mean(cuts_hc == km_sil$cluster) * 100
+# Agreement check — label-permutation-aware
+# Cluster labels (1/2/3) are arbitrary and can differ between methods.
+# Remap K-Means labels to best match Hierarchical via contingency table.
+ct      <- table(hclust = cuts_hc, kmeans = km_sil$cluster)
+remap   <- apply(ct, 1, which.max)           # for each HC label, find best-matching KM label
+km_remapped  <- remap[as.character(km_sil$cluster)]
+agreement_pct <- mean(cuts_hc == km_remapped) * 100
 ```
 
-Both hierarchical and K-Means silhouette plots show average widths of 0.407 at k=3. For a universe of only 11 ETFs, a score above 0.4 indicates solid separation. ETF 5 (Utilities) shows near-zero width in the hierarchical solution, which is expected: XLU sits at the behavioral boundary between defensive and cyclical clusters and can move either way depending on rates. Crucially, both methods agree on the same assignments, confirming that k=3 reflects genuine structure rather than a quirk of one algorithm.
+Both hierarchical and K-Means silhouette plots show average widths of 0.407 at k=3. For a universe of only 11 ETFs, a score above 0.4 indicates solid separation. XLU (Utilities) shows near-zero width in the hierarchical solution — expected, as it sits at the behavioral boundary between defensive and cyclical clusters. Both methods agree on the same underlying groupings once cluster labels are aligned (see table below). Clustering algorithms assign label numbers arbitrarily, so "Cluster 1" in one method may be called "Cluster 2" in another. After remapping, agreement is `r round(agreement_pct, 1)`%.
 
 ```{r method-comparison}
-# Compare cluster assignments at the last training date
-cluster_history |>
+# Compare cluster assignments — remap K-Means labels to match Hierarchical ordering
+snap_compare <- cluster_history |>
   filter(date == last_train_date) |>
-  select(symbol, cluster_hclust = cluster, cluster_kmeans) |>
-  mutate(agree = if_else(cluster_hclust == cluster_kmeans, "✓ Agree", "✗ Differ")) |>
+  select(symbol, cluster_hclust = cluster, cluster_kmeans)
+
+# Apply the same label remap computed above
+snap_compare <- snap_compare |>
+  mutate(
+    km_relabeled = remap[as.character(cluster_kmeans)],
+    agree        = if_else(cluster_hclust == km_relabeled, "✓ Agree", "✗ Differ")
+  )
+
+snap_compare |>
+  select(symbol, cluster_hclust, cluster_kmeans, km_relabeled, agree) |>
   gt() |>
   tab_header(
     title    = "K-Means vs Hierarchical Cluster Assignments",
-    subtitle = paste("As of", format(last_train_date))
+    subtitle = paste0("As of ", format(last_train_date),
+                      " | K-Means labels relabeled to match Hierarchical ordering")
   ) |>
   cols_label(
     symbol         = "ETF",
     cluster_hclust = "Hierarchical",
-    cluster_kmeans = "K-Means",
+    cluster_kmeans = "K-Means (raw)",
+    km_relabeled   = "K-Means (relabeled)",
     agree          = "Agreement"
+  ) |>
+  tab_footnote(
+    footnote  = "Cluster labels are arbitrary integers. Relabeled K-Means assigns each K-Means cluster the Hierarchical label it most overlaps with.",
+    locations = cells_column_labels(columns = km_relabeled)
   ) |>
   tab_style(
     style     = cell_fill(color = "#E8F5E9"),
