@@ -1792,8 +1792,8 @@ sensitivity_tau |>
 #       Low Q  → slow-adapting, smoother state, fewer signal flips (like long MA)
 #       High Q → fast-adapting, reactive state, more signal flips (like short MA)
 #       Directly analogous to the professor's short-MA vs long-MA parameter pair.
-par1_grid <- seq(0.25, 2.50, by = 0.10)                        # τ  — 23 values
-par2_grid <- round(seq(0.0001, 0.005, length.out = 9), 6)      # Q  —  9 values
+par1_grid <- seq(0.10, 3.00, by = 0.10)                         # τ  — 29 values
+par2_grid <- round(seq(0.00005, 0.01, length.out = 12), 6)     # Q  — 12 values
 
 out <- expand.grid(
   par1value = par1_grid,
@@ -1801,7 +1801,7 @@ out <- expand.grid(
 )
 
 cat("Running 2-parameter grid:", nrow(out), "combinations",
-    "(", length(par1_grid), "τ ×", length(par2_grid), "KF_Q)...\n")
+    "(", length(par1_grid), "τ ×", length(par2_grid), "KF_Q) ...\n")
 
 # ── Pre-compute Kalman z-scores for each unique Q value (9 fast Kalman runs) ───
 # residuals_daily is ALREADY in memory — no slide_dbl needed at all.
