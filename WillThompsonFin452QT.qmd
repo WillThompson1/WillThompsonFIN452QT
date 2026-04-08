@@ -1193,7 +1193,7 @@ The top panel shows the Kalman filtered state (blue) overlaid on the observed re
 
 # Portfolio Construction
 
-At each month-end, signals are ranked by z-score magnitude. Long positions are equal-weighted within the long book and short positions equal-weighted within the short book. The strategy holds at most 3 long and 3 short positions per rebalance. Months with no qualifying signals produce zero returns: idle capital is preferable to weak, underpowered trades.
+At each month-end, signals are ranked by z-score magnitude. Long positions are equal-weighted within the long book and short positions equal-weighted within the short book. The strategy holds at most 3 long and 3 short positions per rebalance. The signal threshold of ±1.0 standard deviations is intentionally strict — most ETF-months produce a NEUTRAL signal, meaning the strategy is flat the majority of the time. Idle capital is preferable to weak, underpowered trades.
 
 ```{r signal-generation}
 signals_monthly <- kalman_results |>
@@ -1266,24 +1266,38 @@ positions_all <- signals_monthly |>
   group_modify(~ build_positions(.x)) |>
   ungroup()
 
-# Portfolio exposure summary
-pos_summary <- positions_all |>
+# Portfolio exposure summary — join against ALL training month-ends so flat months
+# (no qualifying signals) are counted as zero, not omitted entirely.
+pos_active <- positions_all |>
   group_by(date) |>
   summarise(n_long  = sum(signal == "LONG"),
             n_short = sum(signal == "SHORT"),
             gross   = sum(abs(weight)),
             net     = sum(weight), .groups = "drop")
 
+pos_summary <- tibble(date = train_month_ends) |>
+  left_join(pos_active, by = "date") |>
+  mutate(across(c(n_long, n_short, gross, net), ~ replace_na(., 0)))
+
+n_total   <- nrow(pos_summary)
+n_flat    <- sum(pos_summary$gross == 0)
+n_active  <- n_total - n_flat
+
 tibble(
-  Metric = c("Avg long positions per month", "Avg short positions per month",
-             "Months with no positions", "Total rebalance dates"),
-  Value  = c(round(mean(pos_summary$n_long), 1),
-             round(mean(pos_summary$n_short), 1),
-             sum(pos_summary$gross == 0),
-             nrow(pos_summary))
+  Metric = c("Total training rebalance dates",
+             "Months with at least one position",
+             "Months with no positions (flat)",
+             "Avg long positions (active months only)",
+             "Avg short positions (active months only)"),
+  Value  = c(n_total,
+             n_active,
+             n_flat,
+             round(mean(pos_active$n_long), 1),
+             round(mean(pos_active$n_short), 1))
 ) |>
   gt() |>
-  tab_header(title = "Portfolio Activity Summary") |>
+  tab_header(title    = "Portfolio Activity Summary",
+             subtitle = "Training period (2000–2024)") |>
   cols_label(Metric = "Metric", Value = "Value")
 
 # Gross/net exposure chart
