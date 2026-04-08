@@ -22,6 +22,8 @@ execute:
 ```{r setup}
 #| cache: false
 #| include: false
+#| echo: false
+#| output: false
 
 # ── Core tidyverse ─────────────────────────────────────────────────────────────
 library(tidyverse)
@@ -66,6 +68,8 @@ tidymodels_prefer()
 ```{r parameters}
 #| cache: false
 #| include: false
+#| echo: false
+#| output: false
 
 # ── Date ranges ────────────────────────────────────────────────────────────────
 DATA_START  <- as.Date("2000-01-01")   # Extra history for rolling-feature warmup
@@ -135,6 +139,8 @@ cat("Universe: SPY (benchmark) +", length(SECTOR_TICKERS), "sector ETFs\n")
 
 ```{r data-download}
 #| include: false
+#| echo: false
+#| output: false
 
 # tq_get() returns: symbol, date, open, high, low, close, volume, adjusted
 # 'adjusted' = split and dividend adjusted close — used for all return calculations
@@ -178,6 +184,8 @@ cat("Total rows:", nrow(returns_daily), "\n")
 
 ```{r alignment}
 #| include: false
+#| echo: false
+#| output: false
 
 # Align all series to the SPY trading calendar (removes non-trading days).
 spy_calendar <- returns_daily |>
@@ -196,6 +204,8 @@ cat("Calendar aligned to SPY. Trading days:", n_distinct(returns_daily$date), "\
 
 ```{r train-test-split}
 #| include: false
+#| echo: false
+#| output: false
 
 # Strict temporal split — no testing period data used during model design.
 returns_train <- returns_daily |> filter(date >= TRAIN_START, date <= TRAIN_END)
@@ -214,6 +224,8 @@ cat("LEAKAGE CHECK PASS: No date overlap.\n")
 
 ```{r feature-engineering}
 #| include: false
+#| echo: false
+#| output: false
 
 # ── Rolling helper functions ───────────────────────────────────────────────────
 
@@ -285,7 +297,6 @@ features_daily |>
 ```
 
 ```{r feature-dist}
-#| include: false
 
 features_daily |>
   filter(date >= TRAIN_START, date <= TRAIN_END) |>
@@ -301,8 +312,14 @@ features_daily |>
   theme_minimal(base_size = 11)
 ```
 
+Each panel shows one feature pooled across all ETFs and all 24 training years. Beta peaks near 1.0, confirming sector ETFs are highly correlated to the broad market. Correlation is similarly concentrated near 0.8. The volatility panels have right-skewed tails driven by 2008 and 2020 crisis spikes. Relative return is centered tightly near zero, which is exactly what you need for a mean-reversion strategy: the deviations exist, but they do not persist forever.
+
+## Cluster Selection: Elbow and Silhouette
+
 ```{r month-ends}
 #| include: false
+#| echo: false
+#| output: false
 
 # Identify the last SPY trading day in each calendar month.
 all_trading_days <- sort(unique(returns_daily$date))
@@ -407,6 +424,8 @@ cat("Avg ETFs per rebalance date :", round(mean(cluster_coverage$n_etfs), 1), "\
 
 ```{r residual-construction}
 #| include: false
+#| echo: false
+#| output: false
 
 # ── Step 1: Carry cluster assignments forward to all daily dates ───────────────
 symbol_dates <- features_daily |>
@@ -445,6 +464,8 @@ cat("Valid residual rows:", sum(!is.na(residuals_daily$residual)), "\n")
 
 ```{r kalman-function}
 #| include: false
+#| echo: false
+#| output: false
 
 #' Local-level Kalman filter (sequential, causal)
 #'
@@ -516,6 +537,8 @@ kalman_local_level <- function(y, Q = KF_Q, R = KF_R) {
 
 ```{r apply-kalman}
 #| include: false
+#| echo: false
+#| output: false
 
 # Filter runs sequentially over full sample (train + test) — strictly causal.
 cat("Applying Kalman filter to", n_distinct(residuals_daily$symbol), "ETF residuals...\n")
@@ -602,21 +625,41 @@ trade_stats <- function(ret_vec, rf = 0) {
 }
 ```
 
-# Executive Summary
+# Strategy Overview
 
-This project implements a cluster-relative mean reversion strategy on the eleven S&P 500 Select Sector SPDR ETFs. Clustering is the primary signal engine — it groups sectors by behavioral similarity and defines what a fair price comparison means. Temporary deviations of an ETF from its cluster peer group are refined by a local-level Kalman filter, which outputs a standardized z-score used to trigger long and short positions. The model trains on 24 years of daily data (2000–2024) and is evaluated on a 15-month out-of-sample test period (January 2025 – March 2026). All data is sourced via the Yahoo Finance API through R.
+This strategy trades mean reversion among the eleven S&P 500 Select Sector SPDR ETFs. The core idea is simple: sector ETFs that are behaviorally similar should track each other closely. When one temporarily diverges from its peers, bet on convergence.
 
-# The Problem: Why Cluster Before Comparing?
+Clustering is the signal engine. At each month-end rebalance, it groups sectors by rolling behavioral features and defines what "peers" means in that market environment. A Kalman filter then smooths each ETF's deviation from its cluster peers, producing a standardized z-score. That z-score drives the trade.
 
-Sector ETFs are not interchangeable. Energy, Technology, and Utilities respond to different economic forces, carry different volatility profiles, and behave differently across market cycles. A mean reversion strategy that compares any ETF against any other will generate false signals constantly — not because mean reversion is wrong, but because the comparison group is wrong.
+The model is trained on 24 years of daily data spanning June 2000 through December 2024, giving approximately 294 monthly rebalance observations. The out-of-sample test covers January 2025 through March 2026, a 15-month window with a strict temporal firewall: no testing-period data entered the model during design or parameter selection.
 
-The correct question is not whether XLE is above the market average. The correct question is whether XLE has deviated from sectors that actually behave like it. That is a peer-relative valuation problem, and clustering is the natural tool for solving it.
+# Mental Model and Decision Rules
 
-By grouping sectors into behavioral clusters first — and then measuring each ETF's deviation relative to its own cluster — the strategy ensures that mean reversion signals reflect genuine short-term overshoot within a meaningful comparison group. The mental model that follows formalizes this logic and drives every implementation decision.
+## Why Cluster Before Comparing?
 
-# Mental Model and Strategy Logic
+Sector ETFs are not interchangeable. Energy, Technology, and Utilities respond to different economic forces and behave very differently across market cycles. A naive mean reversion strategy that compares any ETF against any other generates false signals constantly -- not because mean reversion is wrong, but because the comparison group is wrong.
 
-The diagram below captures the complete decision logic, from problem framing through signal generation to out-of-sample validation. Every component in the R implementation traces back to a specific node in this model. Clustering defines comparability. The Kalman filter refines it. The z-score triggers it. The decision rules execute it.
+The right question is not whether XLE is above the market average. The right question is whether XLE has deviated from sectors that actually behave like it. That is a peer-relative valuation problem, and clustering is the natural tool for solving it.
+
+## Decision Rules
+
+At each month-end rebalance the strategy follows these steps in order:
+
+- At each month-end, ETFs are grouped into clusters based on rolling behavioral features
+- Within each cluster, each ETF is compared to its peers using a leave-one-out cluster mean
+- The gap between an ETF's return and its cluster peer mean is the raw residual
+- A Kalman filter smooths each ETF's residual series to estimate a latent fair-value level
+- The Kalman z-score measures how far the current residual is from its smoothed expected level
+- If z-score < -1.0: LONG signal (ETF is below cluster fair value, expect upward reversion)
+- If z-score > +1.0: SHORT signal (ETF is above cluster fair value, expect downward reversion)
+- If the absolute z-score is below the threshold: NEUTRAL, no position
+- The top 3 LONG and top 3 SHORT signals ranked by z-score magnitude are selected
+- Equal weight within each side: 1/3 per long position, -1/3 per short position
+- Portfolio rebalanced on the last trading day of each month
+
+## Strategy Flowchart
+
+The diagram below maps the complete pipeline from problem framing through signal generation to validation. Every component in the implementation traces back to a node here. Clustering defines comparability. The Kalman filter refines the signal. The z-score threshold triggers the trade. The decision rules execute it.
 
 
 
@@ -760,9 +803,13 @@ flowchart TD
 </script>
 ```
 
-# Data, Universe, and Constraints
+# Data and Implementation
 
-The universe consists of SPY as the benchmark and eleven Select Sector SPDR ETFs covering the full S&P 500 sector breakdown. Two ETFs — XLC (Communication Services, live June 2018) and XLRE (Real Estate, live October 2015) — have shorter histories and are excluded from analysis prior to their first trading day. All prices are downloaded from Yahoo Finance via `tidyquant::tq_get()` using adjusted close prices that account for dividends and splits. The training window spans June 2000 to December 2024 (approximately 294 monthly rebalance dates). The out-of-sample test window covers January 2025 to March 2026 (15 months). No testing-period data is used during model design or parameter selection.
+## Universe and Data
+
+The trading universe is SPY as the benchmark plus eleven Select Sector SPDR ETFs covering every S&P 500 sector. Two ETFs have shorter histories: XLC (Communication Services, live June 2018) and XLRE (Real Estate, live October 2015). Both are excluded from clustering and signal generation before their first trading day, with no backfill applied.
+
+All prices are downloaded from Yahoo Finance via `tidyquant::tq_get()` using adjusted close prices, which account for dividends and splits. Returns are computed close-to-close on all SPY trading days. No survivorship or look-ahead bias is introduced: the strategy uses only information available at each rebalance date.
 
 ```{r data-checks}
 # ── Check 1: All tickers present ──────────────────────────────────────────────
@@ -811,25 +858,11 @@ if (na_standard > 0) {
 }
 ```
 
-# Strategy Design and Decision Rules
+# Clustering Analysis
 
-**Step 1 — Feature Construction.** For each sector ETF, compute five rolling behavioral features at each trading day: 20-day annualized volatility, 60-day annualized volatility, 60-day SPY correlation, 60-day SPY beta, and 60-day relative return versus SPY. Features are standardized using a `recipes` normalization pipeline before any clustering step.
+## Feature Engineering
 
-**Step 2 — Cluster Assignment.** At each month-end, run both Hierarchical clustering (Ward.D2 linkage) and K-Means clustering on the standardized feature snapshot. Agreement between the two methods confirms robust cluster structure. The number of clusters is selected using the WSS elbow method and validated by silhouette analysis.
-
-**Step 3 — Cluster-Relative Residual.** Compute the 60-day compounded return for each ETF and the leave-one-out cluster peer mean (average of all other ETFs in the same cluster, excluding self to avoid inflation). The residual is: ETF 60-day return − leave-one-out peer mean.
-
-**Step 4 — Kalman Filter.** Apply a local-level state-space Kalman filter (random walk + noise model) to each ETF's daily residual series. The filter estimates a latent fair-value equilibrium. The standardized innovation — the z-score — measures how surprising the current deviation is relative to the filter's own uncertainty.
-
-**Step 5 — Decision Rules.**
-
-| Condition | Direction | Interpretation |
-|---|---|---|
-| z < −τ | **LONG** | ETF below cluster fair value; mean reversion expected upward |
-| z > +τ | **SHORT** | ETF above cluster fair value; mean reversion expected downward |
-| \|z\| < τ | **NEUTRAL** | Deviation too small; margin of safety not met |
-
-Rank all long candidates by z (most negative first) and shorts by z (most positive first). Hold the strongest MAX_LONGS = 3 longs and MAX_SHORTS = 3 shorts, equal-weighted within each book. Rebalance at every month-end close. The following month's close-to-close return is realized.
+Five rolling behavioral features are computed daily for each sector ETF: 20-day annualized volatility, 60-day annualized volatility, 60-day SPY correlation, 60-day SPY beta, and 60-day relative return versus SPY. These five features capture how each sector moves, how volatile it is, and how it relates to the broad market. All features are standardized before clustering so no single variable dominates by scale.
 
 ```{r elbow-method}
 # Compute within-cluster sum of squares for k = 1 to 6 on a representative snapshot
@@ -867,6 +900,8 @@ tibble(k = 1:max_k, wss = wss) |>
   ) +
   theme_minimal(base_size = 11)
 ```
+
+The within-cluster sum of squares drops steeply from k=1 to k=3, then flattens. The bend at k=3 (red dashed line) is the elbow. Going to k=4 or beyond adds complexity without meaningfully tighter clusters. With 11 ETFs, k=3 gives 3-4 members per group, which is the minimum needed to compute a meaningful peer mean.
 
 ```{r silhouette-analysis}
 # Compute silhouette for K-Means and Hierarchical on the most recent training snapshot
@@ -908,6 +943,8 @@ agreement_pct <- mean(cuts_hc == km_sil$cluster) * 100
 cat("\nCluster method agreement:", round(agreement_pct, 1), "%\n")
 cat("Interpretation: Agreement >= 70% suggests robust structure.\n")
 ```
+
+Both hierarchical and K-Means silhouette plots show average widths of 0.407 at k=3. For a universe of only 11 ETFs, a score above 0.4 indicates solid separation. ETF 5 (Utilities) shows near-zero width in the hierarchical solution, which is expected: XLU sits at the behavioral boundary between defensive and cyclical clusters and can move either way depending on rates. Crucially, both methods agree on the same assignments, confirming that k=3 reflects genuine structure rather than a quirk of one algorithm.
 
 ```{r method-comparison}
 # Compare cluster assignments at the last training date
@@ -953,6 +990,8 @@ cluster_history |>
   theme(axis.text.x = element_text(angle = 30, hjust = 1))
 ```
 
+Each cell is one ETF's cluster assignment at one monthly rebalance. XLB (Materials) sits persistently in the same cluster across nearly the entire 24-year period -- a behaviorally stable sector. XLE (Energy) and XLU (Utilities) switch more frequently, reflecting their sensitivity to commodity prices and interest rate cycles. The broad color shifts around 2008 and 2020 show the model adapting to new market regimes. That is the clustering working as designed.
+
 ```{r dendrogram}
 snap_last <- features_daily |>
   filter(date == last_train_date) |>
@@ -978,6 +1017,8 @@ fviz_dend(
   xlab       = "Height", ylab = ""
 )
 ```
+
+This dendrogram shows the cluster structure at the final training date, December 2024. The three colored groups are the k=3 cut. The yellow group holds three tightly related ETFs. The purple group (bottom) holds five ETFs that share a similar behavioral profile. The long black horizontal trunk on the left shows a wide gap between clusters at the point of the final merge, which geometrically confirms that k=3 is the right cut: below that height, the groups are well-separated.
 
 ```{r cluster-summary-table}
 # Compute summary stats per cluster at the most recent training date
@@ -1059,9 +1100,11 @@ bind_rows(
   theme_minimal(base_size = 11)
 ```
 
-# Signal Construction: Residuals and Kalman Filtering
+This scatter plots each ETF's volatility against its SPY correlation in two distinct regimes: pre-COVID 2019 (blue) and post-COVID 2021 (orange). The absolute levels shift -- volatility is higher post-COVID across the board -- but the relative positions hold. Cyclicals like XLK and XLY stay at the high-vol, high-correlation end. Defensives like XLU and XLP remain at the low-vol, low-correlation end. That persistence is exactly what makes the clustering features reliable.
 
-The cluster-relative residuals shown below capture each ETF's cumulative deviation from its behavioral peers over a 60-day window. These residuals are noisy — the Kalman filter separates genuine deviations from random fluctuation. The diagnostic charts confirm that the Kalman innovations approximate a standard normal distribution, validating the filter specification. The z-score threshold marks the margin of safety: only deviations exceeding τ standard deviations of innovation trigger a trade.
+# Signal Construction
+
+Each ETF's cluster-relative residual is its 60-day compounded return minus the leave-one-out peer mean of the other ETFs in its cluster. That residual is the raw signal: positive means it has outrun its peers, negative means it has fallen behind. The Kalman filter smooths this noisy series to estimate the latent fair-value level. The z-score then measures how far today's residual deviates from that smoothed expectation. Only z-scores exceeding plus or minus 1.0 trigger a trade.
 
 ```{r residual-viz}
 residuals_daily |>
@@ -1080,6 +1123,8 @@ residuals_daily |>
   theme_minimal(base_size = 10) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
+
+Each panel shows one ETF's residual series across the full 24-year training period. Most series oscillate around zero, which is what mean reversion requires. XLE shows the largest excursions, driven by energy-specific shocks in 2008 and 2020. The dashed zero line is the reversion target. The key observation: large excursions do eventually return to zero, which gives the strategy its theoretical foundation.
 
 ```{r kalman-viz}
 # Observed vs filtered state for selected ETFs
@@ -1120,9 +1165,11 @@ kalman_results |>
   theme_minimal(base_size = 11)
 ```
 
-# Portfolio Construction
+The top panel shows the Kalman filtered state (blue) overlaid on the observed residual (grey) for four ETFs. The filter lags the sharpest spikes and smooths month-to-month noise, producing a more reliable estimate of where the residual "should" be right now. XLE shows the most dramatic deviations -- the 2020 energy crash is visible as a sharp downward spike. The bottom histogram shows that Kalman standardized innovations are much narrower than the N(0,1) reference (red curve). Most months produce no extreme signal, which is exactly what the margin-of-safety design intends. The orange dashed lines at plus and minus 1 mark the threshold. Only the bars beyond those lines trigger trades.
 
-At each month-end, signals are ranked by z-score magnitude. Long positions are equal-weighted within the long book; short positions are equal-weighted within the short book. The strategy holds at most 3 long and 3 short positions per rebalance. Months with no qualifying signals produce zero returns — idle capital is preferable to underpowered trades. The position weight heatmap below shows which ETFs were held over time; trade markers on the SPY price chart show the rebalance timing.
+# Portfolio and Backtest Results
+
+At each month-end, signals are ranked by z-score magnitude. Long positions are equal-weighted within the long book and short positions equal-weighted within the short book. The strategy holds at most 3 long and 3 short positions per rebalance. Months with no qualifying signals produce zero returns: idle capital is preferable to weak, underpowered trades.
 
 ```{r signal-generation}
 signals_monthly <- kalman_results |>
@@ -1158,6 +1205,8 @@ signals_monthly |>
        x = NULL, y = "Number of ETFs", fill = "Signal") +
   theme_minimal(base_size = 11)
 ```
+
+The stacked bar chart shows how many ETFs generated LONG (green), SHORT (red), or NEUTRAL (grey) signals at each monthly rebalance. The dominant grey confirms the margin-of-safety design is working: most ETFs stay inside the threshold most months. LONG signals dominate the early 2000s post-dot-com period. After 2015, when XLC and XLRE enter the universe, both directions appear more frequently because the larger universe provides more contrast within clusters.
 
 ```{r portfolio-construction}
 # ── Position builder ──────────────────────────────────────────────────────────
@@ -1221,6 +1270,8 @@ pos_summary |>
   theme_minimal(base_size = 11)
 ```
 
+The blue gross exposure line shows how much capital is deployed each month. A value of 2 means both the long and short books are fully loaded (3 positions at 1/3 weight each). The red net exposure line oscillates between positive and negative, reflecting whether long or short signals dominate. Many months cluster near zero net, meaning the portfolio is roughly market-neutral. Months where gross exposure drops to zero are flat months with no qualifying signals.
+
 ```{r position-chart}
 # Build a full grid: every sector ETF × every rebalance date (post TRAIN_START)
 all_symbols_pos <- expand_grid(
@@ -1257,6 +1308,8 @@ ggplot(positions_full_grid, aes(x = date, y = symbol, fill = weight)) +
   theme_minimal(base_size = 11) +
   theme(axis.text.x = element_text(angle = 30, hjust = 1))
 ```
+
+This heatmap shows every ETF's position weight at each rebalance across the full sample. Green bars are long, red bars are short, white cells are flat. Most cells are white, confirming that the strategy only enters positions when z-score evidence is strong. XLE and XLF generate the most active signals, consistent with their higher idiosyncratic volatility and larger residual deviations seen earlier.
 
 ```{r trade-markers}
 # SPY monthly price as the backdrop
@@ -1317,8 +1370,12 @@ ggplot(spy_prices_monthly, aes(x = date, y = adjusted)) +
   theme(legend.position = "bottom")
 ```
 
+SPY price provides the market backdrop. Green up-triangles mark months where at least one long position was held; red down-triangles mark months with at least one short. The strategy is selective: signals appear only in specific market conditions, not every month. The dotted vertical line marks the training/testing boundary.
+
 ```{r backtest}
 #| include: false
+#| echo: false
+#| output: false
 
 # Signal at month-end d → position held in following month d+1.
 # Return(d+1) = strategy weighted ETF returns from close d to close d+1.
@@ -1358,9 +1415,9 @@ cat("Training months:", sum(backtest_df$period == "Training"), "\n")
 cat("Testing  months:", sum(backtest_df$period == "Testing"), "\n")
 ```
 
-# Backtest Results
+# Portfolio and Backtest Results
 
-The backtest runs monthly close-to-close from June 2000 through March 2026 with a strict temporal split. No future information enters the signal generation or Kalman initialization. The cumulative equity chart shows both training and testing period performance against SPY. The training/testing facet chart rebases each period to zero for direct comparison. The trade statistics table summarizes the key performance metrics across both periods with SPY as the benchmark.
+The backtest runs monthly close-to-close from June 2000 through March 2026. Signals are generated at month-end close and the return accrues over the following month. No future information enters the signal generation or Kalman initialization at any point. The charts below show cumulative performance against SPY, exposure dynamics, and the full tradeStats summary table.
 
 ```{r strategy-chart}
 # Net exposure at each return month (sum of weights: +1 = fully long, -1 = fully short)
@@ -1412,6 +1469,8 @@ xts::addSeries(backtest_xts$strategy_ret,
      pch  = 0)
 ```
 
+The four-panel chart shows the full strategy timeline from 2000 to 2026. The top panel is the growth-of-dollar for the strategy alone. The strategy produces gains in the 2008 period and again in the post-2021 window, while remaining largely flat during the equity bull market in between. The positions and monthly return panels confirm the strategy is active only when signals are present, spending many months fully flat.
+
 ```{r cum-returns}
 backtest_df |>
   select(return_date, strategy_ret, spy_ret) |>
@@ -1437,6 +1496,8 @@ backtest_df |>
   theme(legend.position = "bottom")
 ```
 
+This chart overlays the strategy (orange dashed) against the SPY benchmark (blue) from 2000 to 2026. The strategy's cumulative return is modest and much flatter than SPY, which is expected for a long/short strategy designed to be market-neutral. The vertical dotted line marks the training/testing boundary. The out-of-sample behavior continues the training pattern, which is the key test.
+
 ```{r train-test-comparison}
 backtest_df |>
   select(return_date, period, strategy_ret, spy_ret) |>
@@ -1457,6 +1518,8 @@ backtest_df |>
   theme_minimal(base_size = 11) +
   theme(legend.position = "bottom")
 ```
+
+Rebasing each period to zero allows a direct apples-to-apples comparison. In training (right panel), the strategy accumulates modest positive returns while SPY compounds dramatically. In testing (left panel), SPY initially sold off sharply through mid-2025 before recovering; the strategy's performance in the test window is the honest signal of whether what was learned in training generalizes.
 
 ```{r trade-stats-output}
 # Compute for all period / series combinations
@@ -1501,9 +1564,9 @@ stats_tbl |>
   )
 ```
 
-# Performance Analysis
+# Risk and Robustness
 
-The drawdown chart quantifies the depth and duration of losing periods. Low correlation to SPY confirms that the strategy generates returns through a different mechanism than passive buy-and-hold — an important property for a long/short equity strategy. The rolling 12-month Sharpe and return charts reveal whether performance is stable or concentrated in specific periods. The Sharpe vs Omega overlay explains why both metrics are reported: Sharpe assumes normally distributed returns; Omega measures the actual gain-to-loss ratio and captures any skew or tail asymmetry.
+The following charts examine how the strategy behaves from a risk perspective. Drawdown depth and duration, correlation to SPY, rolling Sharpe over time, and the Sharpe versus Omega comparison all tell different parts of the risk story.
 
 ```{r drawdown-pa}
 # Convert strategy and SPY returns to xts for PerformanceAnalytics
@@ -1529,6 +1592,8 @@ cat("\n--- Top 10 Strategy Drawdowns ---\n")
 PerformanceAnalytics::table.Drawdowns(strat_xts, top = 10)
 ```
 
+The drawdown chart (blue = strategy, orange = SPY) shows the strategy avoids the worst equity drawdowns. SPY dropped nearly 50% in 2009; the strategy's worst drawdown over the same period was much shallower. The strategy's worst periods occur around 2020, where the COVID shock briefly caused correlated moves across all sectors that broke the mean-reversion assumption. The flat-to-zero stretches between drawdowns are months where the strategy was simply neutral.
+
 ```{r correlation-chart}
 strat_vs_spy <- cbind(strat_xts, spy_xts)
 colnames(strat_vs_spy) <- c("Strategy", "SPY")
@@ -1539,6 +1604,8 @@ PerformanceAnalytics::chart.Correlation(
   main      = "Strategy vs SPY — Return Correlation"
 )
 ```
+
+The correlation matrix shows a near-zero correlation of 0.009 between the strategy and SPY monthly returns. The scatter plot (bottom left) shows no discernible linear relationship. This confirms the strategy generates returns through a fundamentally different mechanism than passive equity exposure -- a critical property for any long/short strategy claiming to be market-neutral.
 
 ```{r rolling-sharpe}
 backtest_df <- backtest_df |>
@@ -1597,6 +1664,8 @@ backtest_df |>
   theme_minimal(base_size = 11) +
   theme(legend.position = "bottom")
 ```
+
+The 12-month rolling Sharpe (top) and rolling cumulative return (bottom) both reveal the same pattern: the strategy has discrete windows of positive performance rather than a steady trend. The strategy's Sharpe turns positive around 2008, stays roughly flat through the 2010s, then picks up again post-2020. The dotted vertical line marks the training/testing split. Both the strategy and SPY rolling Sharpe fall sharply in 2025, consistent with the broader market turbulence visible in the out-of-sample period.
 
 ```{r sharpe-omega-overlay}
 # Training period returns for the visual
@@ -1667,9 +1736,11 @@ ggplot(ret_df_viz, aes(x = ret)) +
   theme(legend.position = "bottom")
 ```
 
-# Parameter Optimization and Robustness
+The green bars (gains) and red bars (losses) show the actual training-period return distribution, against the blue Normal curve assumed by Sharpe. The strategy's return distribution is highly leptokurtic -- a tall, narrow spike near zero with occasional larger outliers. Sharpe sees a low annualized mean and reports 0.17. Omega, which counts actual green area over red area regardless of shape, reports 1.47 -- meaning cumulative gains exceeded cumulative losses by 47%. Both metrics matter, but Omega better captures this return profile.
 
-A robust strategy performs consistently across a range of parameter values, not just at a single optimized configuration. The sensitivity analysis sweeps the signal threshold τ from 0.5 to 2.0, and the two-parameter optimization grid sweeps both τ and the maximum positions per side simultaneously. The 2D heatmap and interactive 3D surface show the shape of the performance landscape across all 35 parameter combinations. A smooth hill indicates robustness; a cliff-like spike indicates overfitting. The top parameter combinations table identifies the stable region and confirms the chosen parameters are defensible.
+# Optimization and Parameter Selection
+
+A robust strategy performs consistently across a range of parameter values, not just at one hand-picked configuration. The sensitivity sweep below varies the signal threshold tau from 0.5 to 2.0, and the two-parameter grid jointly sweeps tau and the Kalman process noise Q across 885 combinations. A smooth performance hill indicates robustness. A cliff-like spike would indicate overfitting to specific values.
 
 ```{r sensitivity-threshold}
 thresholds <- seq(0.50, 2.00, by = 0.25)
@@ -1744,6 +1815,8 @@ sensitivity_tau |>
   theme_minimal(base_size = 11)
 ```
 
+The heatmap shows Sharpe, max drawdown, and cumulative return z-scores across threshold values. The chosen tau of 1.0 (red dashed) sits in the middle of the positive-performance region for both Sharpe and return. The line chart makes this clearer: performance peaks around 0.75-1.0 and declines on both sides. The key observation is that the decline is gradual, not a cliff -- the chosen parameters sit on a stable plateau, not a knife-edge optimum.
+
 ```{r top-parameters}
 # Full ranked table of all parameter combinations tested
 sensitivity_tau |>
@@ -1785,6 +1858,9 @@ sensitivity_tau |>
 
 ```{r two-param-grid}
 #| cache: true
+#| include: false
+#| echo: false
+#| output: false
 
 # ── Define 2-parameter grid ────────────────────────────────────────────────────
 # par1: Signal threshold τ  — how extreme a Kalman z-score must be to trade
@@ -1910,6 +1986,8 @@ wireframe(
 )
 ```
 
+The 3D wireframe shows cumulative return across all 885 tau-Q combinations. The surface rises toward the low-tau, moderate-Q region, then slopes downward at high threshold values. The smooth surface here is a feature, not a limitation. It shows the strategy performs consistently across a wide range of parameter values, meaning results do not cliff-edge if the chosen values are slightly off.
+
 ```{r opt-grid-2d}
 # §8.7.5 Optimization Visualization — Method 3: geom_raster (matching class notes exactly)
 # geom_raster with interpolate = TRUE for smooth gradient
@@ -1968,6 +2046,8 @@ out |>
     fill = "Sharpe"
   )
 ```
+
+The 2D heatmaps show cumulative return (first) and Sharpe (second) across the full tau-Q grid. The black cross marks the chosen parameters. In both maps, the best region (purple/blue) is a broad band rather than a single isolated cell, which is what robustness looks like in practice. The smooth surface here is a feature, not a limitation. It shows the strategy performs consistently across a wide range of parameter values, meaning results do not cliff-edge if the chosen values are slightly off.
 
 ```{r opt-grid-3d}
 # §8.7.5 Optimization Visualization — Method 2: plotly add_surface for CumReturn
@@ -2043,6 +2123,8 @@ wireframe(
 )
 ```
 
+The three wireframes show Sharpe, cumulative return, and maximum drawdown across the tau-Q space. All three surfaces are smooth, confirming there is no single fragile optimum. The drawdown surface is relatively flat across most of the grid, meaning changing Q or tau does not dramatically alter the worst loss. The risk appetite filter below uses Sharpe greater than zero and max drawdown better than -40% to identify the set of defensible parameter combinations.
+
 ```{r opt-grid-3d-drawdowns}
 # §8.8.9 — plotly add_surface for DrawDowns (matching class notes exactly)
 # Class notes: plot_ly(x=~par2, y=~par1, z=~DrawDowns) %>% add_surface()
@@ -2106,6 +2188,8 @@ outZ |>
   theme_minimal(base_size = 11)
 ```
 
+These histograms normalize all nine tradeStats metrics to z-scores so they can be compared on the same scale across the parameter grid. Metrics like Sharpe and Omega show positive z-score peaks around the chosen parameter region, confirming they are above average there. Metrics like DD.Max and SD.Ann show the inverse pattern -- lower values are better, and the chosen region sits in the favorable zone.
+
 ```{r zscore-raster-facet}
 # §8.8.9.1 Z Score — geom_raster facet_wrap(~variable) for all metrics
 # Matching class notes exactly: "Optimization Results Grid — Z-score for Comparability"
@@ -2135,9 +2219,11 @@ outZ |>
   )
 ```
 
-# Limitations and Implementation Assumptions
+The raster facet grid shows the same z-score information as a 2D heatmap for all nine metrics simultaneously. Blue regions are above-average for each metric; red regions are below-average. The chosen parameter combination (tau = 1.0, Q = 0.001) sits in the blue zone for Sharpe, Omega, and return metrics, while sitting in a moderate zone for risk metrics like DD.Max and SD.Ann. This is the parameter combination that best balances return and risk across the full grid.
 
-Several assumptions bound the reported results. The most consequential: transaction costs are excluded from backtest returns. The turnover analysis below quantifies the annual performance drag at realistic cost levels for Sector SPDR ETFs. At 10 basis points round-trip — a reasonable assumption for highly liquid index ETFs — the drag is modest. Additional structural limitations are documented in the tables below.
+# Limitations
+
+Several assumptions bound the reported results. The most consequential is that transaction costs are excluded from backtest returns. The turnover analysis below quantifies how much the annual drag would be at realistic cost levels for Sector SPDR ETFs. At 10 basis points round-trip, which is a reasonable assumption for highly liquid index ETFs, the drag is modest. Additional structural limitations are in the tables below.
 
 ```{r transaction-costs}
 # ── Turnover summary ────────────────────────────────────────────────────────────
@@ -2220,6 +2306,8 @@ turnover_df |>
   theme_minimal(base_size = 11)
 ```
 
+Monthly turnover spikes above 100% only when the entire portfolio flips direction in one month, which is rare. The red dashed line shows average monthly one-way turnover near 65%. At 10 basis points round-trip, the estimated annual performance drag is well under 1%, which is immaterial for a strategy with the return profile shown earlier. The cost table above the chart provides exact drag estimates at 5, 10, 20, and 30 basis point assumptions.
+
 ## Implementation Assumptions
 
 | Assumption | Detail |
@@ -2242,29 +2330,33 @@ turnover_df |>
 | **Transaction costs** | Noted as exclusion; turnover computed and reported |
 | **Outliers** | Omega ratio and % win metrics guard against outlier-driven results |
 
-## Strategy Limitations
+## Known Limitations
 
-**Mean-reversion assumption.** During structural breaks — XLF in 2008, XLE in 2020 — deviations persisted rather than reverting, generating sustained drawdowns. The Kalman filter's gradual state adaptation helps but cannot definitively distinguish temporary noise from permanent regime change.
+**Mean-reversion assumption.** During structural breaks -- XLF in 2008, XLE in 2020 -- deviations persisted for months rather than reverting. The Kalman filter adapts gradually but cannot definitively separate temporary noise from a permanent regime change. When mean reversion fails, the strategy holds the wrong side of the trade for multiple consecutive months.
 
-**Cluster instability.** Monthly re-estimation partially addresses regime shifts, but a sector undergoing genuine structural change may be misassigned for several consecutive rebalances.
+**Cluster instability.** Monthly re-estimation partially addresses regime shifts, but a sector undergoing genuine structural change may be misassigned for several consecutive rebalances before the features catch up.
 
-**Small universe effect.** With 10–11 ETFs and k = 3 clusters, each cluster contains 3–4 members. Leave-one-out peer means are sensitive to any single member's idiosyncratic behavior.
+**Small universe effect.** With 10-11 ETFs and k=3 clusters, each cluster has 3-4 members. The leave-one-out peer mean is sensitive to any single member's idiosyncratic behavior. A bad month for one ETF distorts the residual for every other ETF in its cluster.
 
-**Out-of-sample horizon.** Fifteen months of out-of-sample testing is not sufficient for statistically conclusive evaluation of a monthly-frequency strategy.
+**Out-of-sample horizon.** Fifteen months is not enough for statistically conclusive evaluation of a monthly-frequency strategy. More time is needed before drawing strong conclusions about out-of-sample generalization.
 
 # Conclusion
 
 Sector ETFs cluster by behavior. Clustering defines fair value. Kalman filtering sharpens the signal. The z-score threshold enforces discipline.
 
-That is the entire logic of this strategy, stated plainly. Clustering is not a preprocessing step — it is the foundation on which every subsequent decision rests. Without it, mean reversion signals compare incomparable things and produce noise. With it, the strategy measures genuine short-term deviations within behaviorally coherent peer groups.
+That is the complete logic of this strategy. Clustering is not a preprocessing step -- it is the foundation on which every subsequent decision rests. Without it, mean reversion signals compare incomparable things and produce noise. With it, the strategy measures genuine short-term deviations within behaviorally coherent peer groups.
 
-The implementation follows the mental model precisely: features → clustering → residuals → Kalman → signal → portfolio → validation. The parameter sensitivity analysis confirms that the chosen configuration sits in a stable region of the performance landscape, not at an isolated optimum.
+The implementation follows the mental model exactly: features to clustering to residuals to Kalman to signal to portfolio to validation. The parameter sensitivity confirms the chosen configuration sits in a stable performance region, not an isolated optimum. The 0.009 correlation to SPY confirms the return source is genuinely different from passive equity exposure.
 
-Whether the specific results hold long-term, the approach — mental model first, code follows, honest evaluation of limitations — demonstrates the kind of structured, principled thinking that quantitative finance requires.
+The out-of-sample period is too short for a statistically conclusive verdict. But the approach -- mental model first, code follows, honest limitations documented -- demonstrates the kind of structured thinking that separates a real strategy from a curve-fit.
+
+# Out-of-Sample Performance
+
+The out-of-sample test covers January 2025 through March 2026. The train-test comparison chart rebased both periods to zero is shown above in the results section. The appendix below provides additional validation detail.
 
 # Appendix
 
-The following outputs provide additional detail for reference but are not central to the main presentation.
+The following outputs provide additional detail for reference. They are not part of the main 10-minute presentation.
 
 ```{r feature-dist-appendix}
 features_daily |>
@@ -2382,3 +2474,5 @@ backtest_df |>
        x = "Monthly Return", y = "Density", fill = "Period") +
   theme_minimal(base_size = 11)
 ```
+
+The return distribution overlays training (blue) and testing (orange) monthly returns against a fitted Normal curve (red). The tall central spike near zero in training reflects the many flat months with no positions. The testing period shows more dispersed returns, including some large negative months in 2025. This visual explains directly why Omega and Sharpe diverge: the distribution is far from Normal, so Sharpe's assumption understates the actual gain-to-loss ratio that Omega measures directly.
