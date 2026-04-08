@@ -372,6 +372,27 @@ cluster_kmeans <- function(feature_mat, k = N_CLUSTERS, seed = 42L) {
   list(assignments = km$cluster, kmeans_obj = km, scaled = scaled_mat)
 }
 
+# ── Relabel K-Means cluster IDs to best match Hierarchical labels ─────────────
+# K-Means assigns cluster numbers arbitrarily. This finds the one-to-one
+# permutation of K-Means labels that maximises agreement with HC labels.
+relabel_kmeans_to_hc <- function(hc_labels, km_labels) {
+  hc_vals <- sort(unique(hc_labels))
+  km_vals <- sort(unique(km_labels))
+  stopifnot(length(hc_vals) == length(km_vals))
+
+  perms <- do.call(expand.grid, rep(list(hc_vals), length(km_vals)))
+  perms <- perms[apply(perms, 1, function(x) length(unique(x)) == length(x)), , drop = FALSE]
+
+  scores <- apply(perms, 1, function(map_row) {
+    map       <- setNames(as.integer(map_row), km_vals)
+    km_mapped <- unname(map[as.character(km_labels)])
+    sum(km_mapped == hc_labels, na.rm = TRUE)
+  })
+
+  best_map <- setNames(as.integer(perms[which.max(scores), ]), km_vals)
+  unname(best_map[as.character(km_labels)])
+}
+
 # ── Apply clustering at a single rebalance date ────────────────────────────────
 cluster_at_date <- function(d, features_df, k = N_CLUSTERS) {
   snap <- features_df |>
@@ -942,29 +963,22 @@ p_sil_km <- p_sil_km +
 
 p_sil_hc / p_sil_km
 
-# Agreement check — use cluster_history (same source as the comparison table)
-# apply(ct,2,which.max) returns the ROW POSITION of the max, not the row label.
-# Explicitly map position → row name to get the correct HC label for each KM label.
-snap_agr      <- cluster_history |> filter(date == last_train_date)
-ct            <- table(hclust = snap_agr$cluster, kmeans = snap_agr$cluster_kmeans)
-best_pos      <- apply(ct, 2, which.max)          # position of max HC label per KM column
-remap         <- setNames(as.integer(rownames(ct)[best_pos]), colnames(ct))
-km_remapped   <- remap[as.character(snap_agr$cluster_kmeans)]
-agreement_pct <- mean(snap_agr$cluster == km_remapped) * 100
+# Agreement check — use relabel_kmeans_to_hc() for correct label-permutation-aware comparison
+km_sil_relabeled <- relabel_kmeans_to_hc(cuts_hc, km_sil$cluster)
+agreement_pct    <- mean(cuts_hc == km_sil_relabeled) * 100
 ```
 
 Both hierarchical and K-Means silhouette plots show average widths of 0.407 at k=3. For a universe of only 11 ETFs, a score above 0.4 indicates solid separation. XLU (Utilities) shows near-zero width in the hierarchical solution — expected, as it sits at the behavioral boundary between defensive and cyclical clusters. Both methods agree on the same underlying groupings once cluster labels are aligned (see table below). Clustering algorithms assign label numbers arbitrarily, so "Cluster 1" in one method may be called "Cluster 2" in another. After remapping, agreement is `r round(agreement_pct, 1)`%.
 
 ```{r method-comparison}
-# Compare cluster assignments — remap K-Means labels to match Hierarchical ordering
+# Compare cluster assignments — use relabel_kmeans_to_hc() for correct permutation mapping
 snap_compare <- cluster_history |>
   filter(date == last_train_date) |>
   select(symbol, cluster_hclust = cluster, cluster_kmeans)
 
-# Apply the same label remap computed above
 snap_compare <- snap_compare |>
   mutate(
-    km_relabeled = remap[as.character(cluster_kmeans)],
+    km_relabeled = relabel_kmeans_to_hc(cluster_hclust, cluster_kmeans),
     agree        = if_else(cluster_hclust == km_relabeled, "✓ Agree", "✗ Differ")
   )
 
